@@ -35,8 +35,8 @@ export const getAllShipments = async (req, res) => {
     }
 
     const shipments = await Shipment.find(filter)
-      .populate('assignedAgent', 'name email')
-      .populate('user', 'name email');
+      .populate('sender', 'name email')
+      .populate('agent', 'name email');
 
     res.json(shipments);
   } catch (error) {

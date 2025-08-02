@@ -3,6 +3,24 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import generateToken from '../utils/generateJWT.js'; // assumed to be your own JWT utility
 
+
+
+// @desc   Middleware to protect routes
+export const protect = async (req, res, next) => {
+  let token = req.headers.authorization?.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ message: 'Not authorized, token missing' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = await User.findById(decoded.id).select('-password');
+    next();
+  } catch (error) {
+    res.status(401).json({ message: 'Not authorized, token failed' });
+  }
+};
 // @desc   Register a new user
 // @route  POST /api/users/register
 export const registerUser = async (req, res) => {
@@ -60,6 +78,7 @@ export const loginUser = async (req, res) => {
       token: generateToken(user._id),
     });
   } catch (error) {
+    console.error('Login Error: fullName, phoneNumber, role, are required.', error);
     res.status(500).json({ error: error.message });
   }
 };
@@ -101,22 +120,7 @@ export const deleteUser = async (req, res) => {
   }
 };
 
-// @desc   Middleware to protect routes
-export const protect = async (req, res, next) => {
-  let token = req.headers.authorization?.split(' ')[1];
 
-  if (!token) {
-    return res.status(401).json({ message: 'Not authorized, token missing' });
-  }
-
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = await User.findById(decoded.id).select('-password');
-    next();
-  } catch (error) {
-    res.status(401).json({ message: 'Not authorized, token failed' });
-  }
-};
 
 // @desc    Get user profile
 // @route   GET /api/users/profile

@@ -2,17 +2,6 @@ import mongoose from 'mongoose';
 
 import sanitizeHtml from 'sanitize-html';
 
-const sanitizedDescription = sanitizeHtml(req.body.packageDetails.description || '');
-const sanitizedInstructions = sanitizeHtml(req.body.packageDetails.specialInstructions || '');
-
-const shipment = new Shipment({
-  ...otherData,
-  packageDetails: {
-    ...req.body.packageDetails,
-    description: sanitizedDescription,
-    specialInstructions: sanitizedInstructions,
-  },
-});
 
 
 const shipmentSchema = new mongoose.Schema(

@@ -10,8 +10,10 @@ import {
 const router = express.Router();
 
 router.post('/', protect, createShipment);
+router.get('/my', protect, getMyShipments);
 router.get('/my-shipments', protect, getMyShipments);    // changed from '/' to '/my-shipments'
 router.put('/:id/cancel', protect, cancelShipment);
 router.get('/:id', protect, getShipmentByIdForUser);
+
 
 export default router;

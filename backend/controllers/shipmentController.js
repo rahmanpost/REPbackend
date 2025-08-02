@@ -61,7 +61,7 @@ export const getMyShipments = async (req, res) => {
       createdAt: -1,
     });
 
-    res.json(shipments);
+    res.status(200).json(shipments);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }

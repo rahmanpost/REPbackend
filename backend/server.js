@@ -1,8 +1,6 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import mongoose from 'mongoose';
-import mongoSanitize from 'express-mongo-sanitize';
-
 import userRoutes from './routes/userRoutes.js';
 import shipmentRoutes from './routes/shipmentRoutes.js';
 import adminRoutes from './routes/adminRoutes.js';
@@ -29,7 +27,7 @@ mongoose
   });
 
 // Routes
-app.use(mongoSanitize());
+
 app.use('/api/users', userRoutes);
 app.use('/api/shipments', shipmentRoutes);
 app.use('/api/admin', adminRoutes);

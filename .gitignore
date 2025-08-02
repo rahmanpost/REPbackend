@@ -39,5 +39,4 @@ coverage/
 *.tgz
 *.gz
 
-# Optional: ignore test result outputs or temp files
-/test-results/
+

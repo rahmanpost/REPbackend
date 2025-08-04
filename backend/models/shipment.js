@@ -11,11 +11,30 @@ const shipmentSchema = new mongoose.Schema(
       ref: 'User',
       required: true,
     },
-    agent: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
-      default: null,
-    },
+    price: {
+  type: Number,
+  required: true,
+  min: 0,
+},
+
+    invoiceNumber: {
+  type: String,
+  required: true,
+  unique: true,
+  index: true
+},
+
+pickupAgent: {
+  type: mongoose.Schema.Types.ObjectId,
+  ref: 'User',
+},
+
+deliveryAgent: {
+  type: mongoose.Schema.Types.ObjectId,
+  ref: 'User',
+},
+
+  
 
     pickupAddress: {
       addressLine: { type: String, required: true, trim: true },
@@ -94,21 +113,22 @@ const shipmentSchema = new mongoose.Schema(
       },
     },
 
-    status: {
-      type: String,
-      enum: [
-        'pickup-scheduled',
-        'picked-up',
-        'origin-hub',
-        'in-transit',
-        'delivery-failed',
-        'returning',
-        'delivered',
-        'returned-to-sender',
-        'cancelled',
-      ],
-      default: 'pickup-scheduled',
-    },
+   status: {
+  type: String,
+  enum: [
+    'pending',            // Created by user
+    'assigned',           // Pickup agent assigned
+    'picked_up',          // Agent picked up the package
+    'at_hub',             // Arrived at central hub
+    'out_for_delivery',   // Delivery agent assigned
+    'delivered',          // Successfully delivered
+    'delivery_failed',    // Attempt failed
+    'returned',           // Returned to sender
+    'cancelled'           // Cancelled by user/admin
+  ],
+  default: 'pending',
+},
+
 
     trackingId: {
       type: String,

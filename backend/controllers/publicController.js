@@ -1,11 +1,12 @@
-// backend/controllers/publicController.js
 import Shipment from '../models/shipment.js';
 
 export const trackShipment = async (req, res) => {
   try {
     const { trackingId } = req.params;
 
-    const shipment = await Shipment.findOne({ trackingId });
+    const shipment = await Shipment.findOne({ trackingId })
+      .populate('pickupAgent', 'name phone')
+      .populate('deliveryAgent', 'name phone');
 
     if (!shipment) {
       return res.status(404).json({ message: 'Shipment not found' });
@@ -14,9 +15,14 @@ export const trackShipment = async (req, res) => {
     res.json({
       trackingId: shipment.trackingId,
       status: shipment.status,
-      lastUpdated: shipment.updatedAt,
-      from: shipment.pickupAddress,
-      to: shipment.receiver,
+      currentLocation: shipment.status === 'delivered' ? 'Delivered' : 'In Transit',
+      pickupAgent: shipment.pickupAgent,
+      deliveryAgent: shipment.deliveryAgent,
+      timestamps: {
+        createdAt: shipment.createdAt,
+        pickedUpAt: shipment.pickupConfirmedAt,
+        deliveredAt: shipment.deliveredAt,
+      },
     });
   } catch (error) {
     res.status(500).json({ message: error.message });

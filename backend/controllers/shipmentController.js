@@ -1,16 +1,28 @@
+// backend/controllers/shipmentController.js
+
 import Shipment from '../models/shipment.js';
+import Pricing from '../models/pricing.js';
+import { generateInvoiceNumber } from '../utils/generateInvoiceNumber.js';
 import generateTrackingId from '../utils/generateTrackingId.js';
 
 
-// @desc    Create a new shipment
-// @route   POST /api/shipments
-// @access  Authenticated users (add auth later)
+export const trackShipment = async (req, res) => {
+  const trackingId = req.params.trackingId;
+
+  try {
+    const shipment = await Shipment.findOne({ trackingId });
+
+    if (!shipment) {
+      return res.status(404).json({ message: 'Shipment not found' });
+    }
+
+    res.json({ status: shipment.status, shipment });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
 export const createShipment = async (req, res) => {
-
-  // console.log('REQ.BODY', req.body);
-  // console.log('Authenticated User ID:', req.user?._id);
-  // // Ensure the user is authenticated
-
   try {
     const {
       pickupAddress,
@@ -20,16 +32,31 @@ export const createShipment = async (req, res) => {
       payment,
     } = req.body;
 
+    // Generate tracking ID and invoice number
     const trackingId = generateTrackingId();
+    const invoiceNumber = await generateInvoiceNumber();
 
+    // Lookup pricing based on provinces/cities
+    const pricing = await Pricing.findOne({
+      fromProvince: pickupAddress.city,
+      toProvince: receiver.city,
+    });
+
+    if (!pricing) {
+      return res.status(400).json({ message: 'No pricing found for this route' });
+    }
+
+    // Create shipment document
     const shipment = new Shipment({
-      sender: req.user._id, // from auth middleware (we'll add later)
+      sender: req.user._id, // from auth middleware
       pickupAddress,
       pickupTimeSlot,
       receiver,
       packageDetails,
       payment,
       trackingId,
+      invoiceNumber,
+      price: pricing.price,  // Add price from pricing model
     });
 
     const saved = await shipment.save();
@@ -46,11 +73,12 @@ export const createShipment = async (req, res) => {
       return res.status(400).json({ message: messages.join(', ') });
     }
     if (error.code === 11000) {
-      return res.status(400).json({ message: 'Duplicate trackingId. Please use a unique trackingId.' });
+      return res.status(400).json({ message: 'Duplicate trackingId or invoiceNumber. Please try again.' });
     }
     res.status(500).json({ message: 'Server error' });
   }
 };
+
 
 // @desc    Get shipments for current user
 // @route   GET /api/shipments

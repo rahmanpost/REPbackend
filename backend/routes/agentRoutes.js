@@ -12,6 +12,8 @@ import { markShipmentPickedUp } from '../controllers/agentController.js';
 import { markDeliveryAttempt } from '../controllers/agentController.js';
 import { markReturnStatus } from '../controllers/agentController.js';
 import { markAsReturning } from '../controllers/agentController.js';
+import { getMyDeliveries } from '../controllers/agentController.js';
+
 
 
 
@@ -31,6 +33,7 @@ router.put('/shipments/:id/status', protect, isAgent, updateShipmentProgress);
 // 🚚 Agent confirms pickup of a shipment
 router.put('/shipments/:id/pickup', protect, isAgent, confirmPickup);
 
+router.get('/deliveries', protect, isAgent, getMyDeliveries);
 // 🚚 Agent confirms delivery of a shipment
 router.put('/shipments/:id/deliver', protect, isAgent, confirmDelivery);
 
@@ -39,6 +42,7 @@ router.put('/shipments/:id/deliver', protect, isAgent, updateDeliveryStatus);
 
 // 🚚 Agent marks shipment as picked up
 router.put('/shipments/:id/pickup', protect, isAgent, markShipmentPickedUp);
+
 
 // 🚚 Agent marks delivery attempt
 router.put('/shipments/:id/delivery-attempt', protect, isAgent, markDeliveryAttempt);

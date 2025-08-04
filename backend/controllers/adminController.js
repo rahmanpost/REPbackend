@@ -1,5 +1,69 @@
 import Shipment from '../models/shipment.js';
 import User from '../models/User.js';
+import Pricing from '../models/pricing.js';
+
+// Create or update pricing for a route
+export const createOrUpdatePricing = async (req, res) => {
+  const { fromProvince, toProvince, price } = req.body;
+
+  if (!fromProvince || !toProvince || price == null) {
+    return res.status(400).json({ message: 'Missing required fields' });
+  }
+
+  try {
+    const pricing = await Pricing.findOneAndUpdate(
+      { fromProvince, toProvince },
+      { price },
+      { new: true, upsert: true }
+    );
+
+    res.json({ message: 'Pricing saved successfully', pricing });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// Get all pricing
+export const getAllPricing = async (req, res) => {
+  try {
+    const pricing = await Pricing.find().sort({ fromProvince: 1, toProvince: 1 });
+    res.json(pricing);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// Get price for specific route
+export const getPricingByRoute = async (req, res) => {
+  const { fromProvince, toProvince } = req.params;
+
+  try {
+    const pricing = await Pricing.findOne({ fromProvince, toProvince });
+    if (!pricing) {
+      return res.status(404).json({ message: 'Pricing not found for this route' });
+    }
+    res.json(pricing);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// Delete pricing for a specific route
+export const deletePricing = async (req, res) => {
+  const { fromProvince, toProvince } = req.params;
+
+  try {
+    const result = await Pricing.findOneAndDelete({ fromProvince, toProvince });
+    if (!result) {
+      return res.status(404).json({ message: 'Pricing not found to delete' });
+    }
+    res.json({ message: 'Pricing deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+
 
 
 // @desc    Get all shipments (with optional filters)

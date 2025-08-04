@@ -1,6 +1,6 @@
 import express from 'express';
-import { protect } from '../middleware/authMiddleware.js';
-import { isAdmin } from '../middleware/adminMiddleware.js';
+import { protect,adminOnly,isAdmin } from '../middleware/authMiddleware.js';
+import { createOrUpdatePricing, getAllPricing, getPricingByRoute,deletePricing } from '../controllers/adminController.js';
 import { assignAgentToShipment } from '../controllers/adminController.js';
 import {
   getAllUsers,
@@ -19,8 +19,22 @@ import {
 import { getDashboardStats } from '../controllers/adminController.js';
 
 
-
 const router = express.Router();
+
+// Admin creates or updates a price
+router.post('/pricing', protect, adminOnly, createOrUpdatePricing);
+
+// Admin fetches all pricing data
+router.get('/pricing/all', protect, adminOnly, getAllPricing);
+
+// Admin fetches price for a specific route
+router.get('/pricing/:fromProvince/:toProvince', protect, adminOnly, getPricingByRoute);
+
+// Admin deletes a pricing entry
+router.delete('/pricing/:fromProvince/:toProvince', protect, adminOnly, deletePricing);
+
+
+
 
 // ✅ Now protected
 router.get('/shipments', protect, isAdmin, getAllShipments);

@@ -67,6 +67,21 @@ export const confirmPickup = async (req, res) => {
 };
 
 
+
+export const getMyDeliveries = async (req, res) => {
+  try {
+    const deliveries = await Shipment.find({
+      deliveryAgent: req.user._id,
+      status: 'out_for_delivery',
+    }).sort({ createdAt: -1 });
+
+    res.json(deliveries);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+
 // @desc    Agent confirms delivery of a shipment
 // @route   PUT /api/agent/shipments/:id/deliver
 // @access  Agent only
@@ -109,7 +124,7 @@ export const updateDeliveryStatus = async (req, res) => {
   try {
     const shipment = await Shipment.findOne({
       _id: req.params.id,
-      assignedAgent: req.user._id,
+      deliveryAgent: req.user._id,  // ✅ updated from assignedAgent
     });
 
     if (!shipment) {
@@ -118,12 +133,19 @@ export const updateDeliveryStatus = async (req, res) => {
 
     const { status } = req.body;
 
-    if (!['delivered', 'delivery-failed'].includes(status)) {
+    // ✅ updated valid status values
+    const validStatuses = ['delivered', 'delivery_failed', 'returned'];
+
+    if (!validStatuses.includes(status)) {
       return res.status(400).json({ message: 'Invalid delivery status' });
     }
 
     shipment.status = status;
-    shipment.deliveryUpdatedAt = new Date(); // optional timestamp
+    shipment.deliveryUpdatedAt = new Date();
+
+    if (status === 'delivered') {
+      shipment.deliveredAt = new Date();
+    }
 
     const updated = await shipment.save();
 
@@ -131,10 +153,12 @@ export const updateDeliveryStatus = async (req, res) => {
       message: `Delivery status updated to '${status}'`,
       shipment: updated,
     });
+
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
 };
+
 
 
 // @desc    Mark shipment as picked up
@@ -256,4 +280,5 @@ export const markAsReturning = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+
 

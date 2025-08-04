@@ -6,40 +6,30 @@ import shipmentRoutes from './routes/shipmentRoutes.js';
 import adminRoutes from './routes/adminRoutes.js';
 import agentRoutes from './routes/agentRoutes.js';
 import publicRoutes from './routes/publicRoutes.js';
-import connectDB from './config/db.js'; // Make sure this path is correct
+import pricingRoutes from './routes/pricingRoutes.js';
+import connectDB from './config/db.js';
 
-
-// Load .env file
 dotenv.config();
-
 const app = express();
-connectDB(); // <-- connect to MongoDB here
-// Middleware to parse JSON
+connectDB();
+
+// ✅ Middleware
 app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // <-- Add this
 
-// Connect to MongoDB
-mongoose
-  .connect(process.env.MONGO_URI)
-  .then(() => console.log('✅ MongoDB connected'))
-  .catch((err) => {
-    console.error('❌ MongoDB connection error:', err.message);
-    process.exit(1);
-  });
-
-// Routes
-
+// ✅ Routes
+app.use('/api/pricing', pricingRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/shipments', shipmentRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/agent', agentRoutes);
 app.use('/api/public', publicRoutes);
+app.use('/api/track', publicRoutes);
 
-// Root route
 app.get('/', (req, res) => {
   res.send('🚀 Rahman Express Post API is running...');
 });
 
-// Start server
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);

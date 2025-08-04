@@ -40,9 +40,26 @@ const userSchema = new mongoose.Schema(
       enum: ['user', 'admin', 'agent'],
       default: 'user',
     },
+    emailVerified: {
+  type: Boolean,
+  default: false,
+},
+phoneVerified: {
+  type: Boolean,
+  default: false,
+},
     addresses: [addressSchema],
   },
-  { timestamps: true }
+  { timestamps: true },
+  
+  {
+    emailVerificationToken: String,
+emailVerificationExpire: Date,
+    resetPasswordToken: String,
+    resetPasswordExpire: Date,
+    profilePicture: { type: String },
+
+  }
 );
 
 // ✅ Hash password before saving
@@ -57,6 +74,23 @@ userSchema.pre('save', async function (next) {
 userSchema.methods.matchPassword = async function (enteredPassword) {
   return await bcrypt.compare(enteredPassword, this.password);
 };
+
+
+// reset password schema.methods:
+userSchema.methods.generatePasswordResetToken = function () {
+  const resetToken = crypto.randomBytes(20).toString('hex');
+
+  this.resetPasswordToken = crypto
+    .createHash('sha256')
+    .update(resetToken)
+    .digest('hex');
+
+  this.resetPasswordExpire = Date.now() + 15 * 60 * 1000; // 15 minutes
+
+  return resetToken;
+};
+
+
 
 // ✅ Create model
 const User = mongoose.model('User', userSchema);

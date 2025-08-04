@@ -1,5 +1,5 @@
 import User from '../models/User.js';
-import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import generateToken from '../utils/generateJWT.js'; // assumed to be your own JWT utility
 
@@ -59,29 +59,150 @@ export const registerUser = async (req, res) => {
 };
 
 // @desc   Login user
-// @route  POST /api/users/login
+// @route  POST /api/users/login/resetpassword using JWT
+
+
+const generateAccessToken = (userId) => {
+  return jwt.sign({ id: userId }, process.env.JWT_SECRET, {
+    expiresIn: '15m', // short-lived
+  });
+};
+
+const generateRefreshToken = (userId) => {
+  return jwt.sign({ id: userId }, process.env.JWT_SECRET, {
+    expiresIn: '7d', // long-lived
+  });
+};
+
+
+// Placeholder: request email verification
+export const requestEmailVerification = async (req, res) => {
+  res.json({ message: 'Verification token would be emailed (not implemented).' });
+};
+
+// Placeholder: verify email with token
+export const verifyEmail = async (req, res) => {
+  res.json({ message: 'Email verified successfully (not implemented).' });
+};
+
+
 export const loginUser = async (req, res) => {
+  const { email, password } = req.body;
+
   try {
-    const { phoneNumber, password } = req.body;
+    const user = await User.findOne({ email });
+    if (!user || !(await user.matchPassword(password))) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
 
-    const user = await User.findOne({ phoneNumber });
-    if (!user) return res.status(401).json({ message: 'Invalid phone or password' });
+    const accessToken = generateAccessToken(user._id);
+    const refreshToken = generateRefreshToken(user._id);
 
-    const isMatch = await user.matchPassword(password);
-    if (!isMatch) return res.status(401).json({ message: 'Invalid phone or password' });
-
-    res.status(200).json({
-      _id: user._id,
-      fullName: user.fullName,
-      phoneNumber: user.phoneNumber,
-      role: user.role,
-      token: generateToken(user._id),
+    // Set refresh token as HTTP-only cookie
+    res.cookie('refreshToken', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'Strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     });
-  } catch (error) {
-    console.error('Login Error: fullName, phoneNumber, role, are required.', error);
-    res.status(500).json({ error: error.message });
+
+    res.json({
+      accessToken,
+      user: {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
   }
 };
+// refresh token Access
+export const refreshAccessToken = (req, res) => {
+  const token = req.cookies.refreshToken;
+
+  if (!token) {
+    return res.status(401).json({ message: 'No refresh token provided' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const accessToken = jwt.sign({ id: decoded.id }, process.env.JWT_SECRET, {
+      expiresIn: '15m',
+    });
+
+    res.json({ accessToken });
+  } catch (err) {
+    res.status(403).json({ message: 'Invalid refresh token' });
+  }
+};
+
+//logout user
+export const logoutUser = (req, res) => {
+  res.clearCookie('refreshToken', {
+    httpOnly: true,
+    sameSite: 'Strict',
+    secure: process.env.NODE_ENV === 'production',
+  });
+  res.json({ message: 'Logged out' });
+};
+
+
+
+// @desc   Forgot password
+// @route  POST /api/users/forgot-password
+
+export const forgotPassword = async (req, res) => {
+  const { email } = req.body;
+
+  try {
+    const user = await User.findOne({ email });
+    if (!user)
+      return res.status(404).json({ message: 'User not found' });
+
+    const resetToken = user.generatePasswordResetToken();
+    await user.save({ validateBeforeSave: false });
+
+    const resetUrl = `${req.protocol}://${req.get('host')}/api/users/reset/${resetToken}`;
+
+    // TODO: send email in real use; for now return the token
+    res.json({ message: 'Reset link generated', resetUrl });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+//reset password
+export const resetPassword = async (req, res) => {
+  const hashedToken = crypto
+    .createHash('sha256')
+    .update(req.params.token)
+    .digest('hex');
+
+  try {
+    const user = await User.findOne({
+      resetPasswordToken: hashedToken,
+      resetPasswordExpire: { $gt: Date.now() },
+    });
+
+    if (!user)
+      return res.status(400).json({ message: 'Invalid or expired token' });
+
+    user.password = req.body.password;
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpire = undefined;
+
+    await user.save();
+    res.json({ message: 'Password reset successful' });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+
+
 
 // @desc   Get all users (admin only)
 // @route  GET /api/users
@@ -222,5 +343,20 @@ export const setDefaultAddress = async (req, res) => {
     res.json({ message: 'Default address set', addresses: user.addresses });
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+};
+
+export const uploadProfilePicture = async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id);
+
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    user.profilePicture = req.file.path;
+    await user.save();
+
+    res.status(200).json({ message: 'Profile picture uploaded', user });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
   }
 };

@@ -95,6 +95,13 @@ export const getMyShipments = async (req, res) => {
   }
 };
 
+// shipment status notification
+// Placeholder function to send notifications (Twilio or email integration needed)
+
+export const sendShipmentStatusNotification = (userPhoneOrEmail, status) => {
+  // Placeholder only - integrate Twilio or email later
+  console.log(`📬 Notify ${userPhoneOrEmail} - Shipment status: ${status}`);
+};
 
 
 
@@ -120,6 +127,8 @@ export const updateShipmentStatus = async (req, res) => {
 
     // Update the shipment status and optionally add a location note
     shipment.status = status;
+      sendShipmentStatusNotification(user.email, shipment.status);
+
 
     if (locationNote) {
       shipment.tracking.push({
@@ -134,6 +143,7 @@ export const updateShipmentStatus = async (req, res) => {
     res.status(200).json({
       message: 'Shipment status updated successfully',
       shipment,
+
     });
   } catch (error) {
     console.error('Error updating shipment status:', error);
@@ -192,3 +202,27 @@ export const getShipmentByIdForUser = async (req, res) => {
   }
 };
 
+export const uploadShipmentFiles = async (req, res) => {
+  try {
+    const shipment = await Shipment.findById(req.params.id);
+
+    if (!shipment) {
+      return res.status(404).json({ message: 'Shipment not found' });
+    }
+
+    if (req.files.beforePhoto) {
+      shipment.beforePhoto = req.files.beforePhoto[0].path;
+    }
+    if (req.files.afterPhoto) {
+      shipment.afterPhoto = req.files.afterPhoto[0].path;
+    }
+    if (req.files.receipt) {
+      shipment.receipt = req.files.receipt[0].path;
+    }
+
+    await shipment.save();
+    res.status(200).json({ message: 'Files uploaded successfully', shipment });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};

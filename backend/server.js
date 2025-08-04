@@ -1,5 +1,6 @@
 import express from 'express';
 import dotenv from 'dotenv';
+import cookieParser from 'cookie-parser';
 import mongoose from 'mongoose';
 import userRoutes from './routes/userRoutes.js';
 import shipmentRoutes from './routes/shipmentRoutes.js';
@@ -8,6 +9,11 @@ import agentRoutes from './routes/agentRoutes.js';
 import publicRoutes from './routes/publicRoutes.js';
 import pricingRoutes from './routes/pricingRoutes.js';
 import connectDB from './config/db.js';
+import path from 'path';
+
+
+
+
 
 dotenv.config();
 const app = express();
@@ -15,7 +21,9 @@ connectDB();
 
 // ✅ Middleware
 app.use(express.json());
+app.use(cookieParser());
 app.use(express.urlencoded({ extended: true })); // <-- Add this
+
 
 // ✅ Routes
 app.use('/api/pricing', pricingRoutes);
@@ -25,6 +33,11 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/agent', agentRoutes);
 app.use('/api/public', publicRoutes);
 app.use('/api/track', publicRoutes);
+app.use('/uploads', express.static(path.join(process.cwd(), '/uploads')));
+app.use('/uploads', express.static('uploads'));
+
+
+
 
 app.get('/', (req, res) => {
   res.send('🚀 Rahman Express Post API is running...');

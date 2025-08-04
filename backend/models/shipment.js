@@ -111,6 +111,16 @@ deliveryAgent: {
         enum: ['pending', 'paid', 'collected'],
         default: 'pending',
       },
+      notifiedCustomer: {
+  type: Boolean,
+  default: false,
+},
+
+   beforePhoto: { type: String },
+afterPhoto: { type: String },
+receipt: { type: String },
+
+
     },
 
    status: {

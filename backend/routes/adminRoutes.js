@@ -1,5 +1,5 @@
 import express from 'express';
-import { protect,adminOnly,isAdmin } from '../middleware/authMiddleware.js';
+import { protect,isAdmin } from '../middleware/authMiddleware.js';
 import { createOrUpdatePricing, getAllPricing, getPricingByRoute,deletePricing } from '../controllers/adminController.js';
 import { assignAgentToShipment } from '../controllers/adminController.js';
 import {
@@ -8,6 +8,14 @@ import {
   updateUserRole,
   deleteUserById,
 } from '../controllers/adminUserController.js'; // we'll create this file next
+
+import {
+  createAgent,
+  getAllAgents,
+  getAgentById,
+  updateAgent,
+  deleteAgent,
+} from '../controllers/adminAgentController.js';
 
 
 import {
@@ -22,16 +30,16 @@ import { getDashboardStats } from '../controllers/adminController.js';
 const router = express.Router();
 
 // Admin creates or updates a price
-router.post('/pricing', protect, adminOnly, createOrUpdatePricing);
+router.post('/pricing', protect, isAdmin, createOrUpdatePricing);
 
 // Admin fetches all pricing data
-router.get('/pricing/all', protect, adminOnly, getAllPricing);
+router.get('/pricing/all', protect, isAdmin, getAllPricing);
 
 // Admin fetches price for a specific route
-router.get('/pricing/:fromProvince/:toProvince', protect, adminOnly, getPricingByRoute);
+router.get('/pricing/:fromProvince/:toProvince', protect, isAdmin, getPricingByRoute);
 
 // Admin deletes a pricing entry
-router.delete('/pricing/:fromProvince/:toProvince', protect, adminOnly, deletePricing);
+router.delete('/pricing/:fromProvince/:toProvince', protect, isAdmin, deletePricing);
 
 
 
@@ -42,6 +50,20 @@ router.get('/shipments/:id', protect, isAdmin, getShipmentById);
 router.put('/shipments/:id/status', protect, isAdmin, updateShipmentStatus);
 
 // 🔐 Add below shipment routes
+
+// Agent Management
+router
+  .route('/agents')
+  .post(protect, isAdmin, createAgent)
+  .get(protect, isAdmin, getAllAgents);
+
+router
+  .route('/agents/:id')
+  .get(protect, isAdmin, getAgentById)
+  .put(protect, isAdmin, updateAgent)
+  .delete(protect, isAdmin, deleteAgent);
+
+
 
 // GET all users
 router.get('/users', protect, isAdmin, getAllUsers);

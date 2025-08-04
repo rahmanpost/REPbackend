@@ -2,6 +2,9 @@
 node_modules/
 backend/node_modules/
 
+
+uploads/
+
 # Environment variable files (do NOT commit secrets)
 .env
 backend/.env

@@ -11,25 +11,15 @@ let mongoServer;
 
 beforeAll(async () => {
   mongoServer = await MongoMemoryServer.create();
-  const uri = mongoServer.getUri();
-  await mongoose.connect(uri);
+  await mongoose.connect(mongoServer.getUri());
+  await User.createIndexes();
 });
 
 afterAll(async () => {
   await mongoose.disconnect();
   if (mongoServer) {
-    await mongoServer.stop(); // 💥 Only stop if it's defined
-  }});
-
-
-beforeAll(async () => {
-  mongoServer = await MongoMemoryServer.create();
-  await mongoose.connect(mongoServer.getUri());
-});
-
-afterAll(async () => {
-  await mongoose.disconnect();
-  await mongoServer.stop();
+    await mongoServer.stop();
+  }
 });
 
 describe('User Model Test', () => {

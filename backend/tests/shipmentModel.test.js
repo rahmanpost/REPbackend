@@ -11,31 +11,23 @@ let mongoServer;
 
 beforeAll(async () => {
   mongoServer = await MongoMemoryServer.create();
-  const uri = mongoServer.getUri();
-  await mongoose.connect(uri);
+  await mongoose.connect(mongoServer.getUri());
+  await Shipment.createIndexes();
 });
 
 afterAll(async () => {
   await mongoose.disconnect();
   if (mongoServer) {
-    await mongoServer.stop(); // 💥 Only stop if it's defined
-  }});
-  
-
-beforeAll(async () => {
-  mongoServer = await MongoMemoryServer.create();
-  await mongoose.connect(mongoServer.getUri());
-});
-
-afterAll(async () => {
-  await mongoose.disconnect();
-  await mongoServer.stop();
+    await mongoServer.stop();
+  }
 });
 
 describe('Shipment Model Test', () => {
   it('should create & save shipment successfully', async () => {
     const validShipment = new Shipment({
       sender: new mongoose.Types.ObjectId(),
+      invoiceNumber: 'INV12345',
+      price: 100,
       pickupAddress: { addressLine: '123 Main St', city: 'Kabul' },
       pickupTimeSlot: '9am-11am',
       receiver: {
@@ -64,7 +56,7 @@ describe('Shipment Model Test', () => {
 
     expect(savedShipment._id).toBeDefined();
     expect(savedShipment.pickupAddress.city).toBe('Kabul');
-    expect(savedShipment.status).toBe('pickup-scheduled');
+    expect(savedShipment.status).toBe('pending');
     expect(savedShipment.trackingId).toBe('TRACK12345');
   });
 
@@ -86,11 +78,15 @@ describe('Shipment Model Test', () => {
     expect(err.errors['packageDetails.type']).toBeDefined();
     expect(err.errors['packageDetails.weight']).toBeDefined();
     expect(err.errors.trackingId).toBeDefined();
+    expect(err.errors.invoiceNumber).toBeDefined();
+    expect(err.errors.price).toBeDefined();
   });
 
   it('should fail with invalid phone number in receiver', async () => {
     const shipment = new Shipment({
       sender: new mongoose.Types.ObjectId(),
+      invoiceNumber: 'INV12346',
+      price: 100,
       pickupAddress: { addressLine: '123 Main St', city: 'Kabul' },
       pickupTimeSlot: '9am-11am',
       receiver: {
@@ -125,6 +121,8 @@ describe('Shipment Model Test', () => {
   it('should enforce unique trackingId', async () => {
     const shipment1 = new Shipment({
       sender: new mongoose.Types.ObjectId(),
+      invoiceNumber: 'INV12347',
+      price: 50,
       pickupAddress: { addressLine: '123 Main St', city: 'Kabul' },
       pickupTimeSlot: '9am-11am',
       receiver: {
@@ -149,6 +147,8 @@ describe('Shipment Model Test', () => {
 
     const shipment2 = new Shipment({
       sender: new mongoose.Types.ObjectId(),
+      invoiceNumber: 'INV12348',
+      price: 60,
       pickupAddress: { addressLine: '456 Main St', city: 'Kabul' },
       pickupTimeSlot: '11am-1pm',
       receiver: {

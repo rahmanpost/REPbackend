@@ -13,6 +13,9 @@ import {
 
 import upload from '../middleware/uploadMiddleware.js';
 import { isAgent } from '../middleware/authMiddleware.js';
+import { downloadInvoice } from '../controllers/invoiceController.js';  
+
+
 
 const router = express.Router();
 
@@ -32,6 +35,8 @@ router.put(
   ]),
   uploadShipmentFiles
 );
+router.get('/shipments/:id/invoice', protect, downloadInvoice);
+router.get('/:id/invoice', protect, downloadInvoice);
 
 
 export default router;

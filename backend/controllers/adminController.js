@@ -1,6 +1,7 @@
 import Shipment from '../models/shipment.js';
 import User from '../models/User.js';
 import Pricing from '../models/pricing.js';
+import TrackingLog from '../models/TrackingLog.js';
 
 // Create or update pricing for a route
 export const createOrUpdatePricing = async (req, res) => {
@@ -183,31 +184,55 @@ export const getAdminStats = async (req, res) => {
 
 
 
+// backend/controllers/adminController.js
+
+
 export const assignAgentToShipment = async (req, res) => {
   try {
-    const shipment = await Shipment.findById(req.params.id);
-    if (!shipment) return res.status(404).json({ message: 'Shipment not found' });
+    const { shipmentId, agentId } = req.body;
 
-    const { agentId } = req.body;
-    const agent = await User.findById(agentId);
-
-    if (!agent || agent.role !== 'agent') {
-      return res.status(400).json({ message: 'Invalid agent user' });
+    if (!shipmentId || !agentId) {
+      return res.status(400).json({ message: 'shipmentId and agentId are required' });
     }
 
-    shipment.agent = agentId;
+    // Check if shipment exists
+    const shipment = await Shipment.findById(shipmentId);
+    if (!shipment) {
+      return res.status(404).json({ message: 'Shipment not found' });
+    }
+
+    // Check if user is an agent
+    const agent = await User.findById(agentId);
+    if (!agent || agent.role !== 'agent') {
+      return res.status(400).json({ message: 'User is not a valid agent' });
+    }
+
+    // Assign the agent to the shipment
+    shipment.agent = agent._id;
     await shipment.save();
 
-    res.status(200).json({
-      message: 'Agent assigned to shipment',
-      shipmentId: shipment._id,
-      agentId: agent._id,
+    // Create initial tracking log with agent
+    await TrackingLog.create({
+      shipment: shipment._id,
+      agent: agent._id,
+      location: {
+        type: 'Point',
+        coordinates: [0, 0], // Default or from GPS device if available
+      },
+      status: 'agent_assigned',
     });
+
+    return res.status(200).json({
+      message: 'Agent assigned and tracking started.',
+      shipment,
+    });
+
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
+    console.error('Error assigning agent:', error);
+    return res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
+
 
 
 // @desc    Get dashboard stats

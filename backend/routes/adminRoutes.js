@@ -1,7 +1,8 @@
 import express from 'express';
-import { protect,isAdmin } from '../middleware/authMiddleware.js';
 import { createOrUpdatePricing, getAllPricing, getPricingByRoute,deletePricing } from '../controllers/adminController.js';
 import { assignAgentToShipment } from '../controllers/adminController.js';
+import { protect,isAdmin } from '../middleware/authMiddleware.js';
+
 import {
   getAllUsers,
   getUserById,
@@ -79,7 +80,7 @@ router.delete('/users/:id', protect, isAdmin, deleteUserById);
 // PUT assign agent to shipment
 // router.put('/shipments/:id/assign', assignAgentToShipment);
 
-router.put('/shipments/:id/assign-agent', protect, isAdmin, assignAgentToShipment);
+router.put('/assign-agent', protect, isAdmin, assignAgentToShipment);
 
 // 📊 GET /api/admin/dashboard
 router.get('/dashboard', protect, isAdmin, getDashboardStats);

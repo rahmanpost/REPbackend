@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 
+
 const addressSchema = new mongoose.Schema({
   province: { type: String, trim: true },
   district: { type: String, trim: true },

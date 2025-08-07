@@ -1,8 +1,10 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import cookieParser from 'cookie-parser';
-import mongoose from 'mongoose';
 import path from 'path';
+import cors from 'cors';
+import mongoSanitize from 'express-mongo-sanitize';
+import rateLimit from 'express-rate-limit';
 
 import connectDB from './config/db.js';
 
@@ -24,7 +26,17 @@ dotenv.config();
 
 const app = express();
 
+// Security middleware
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
+app.use(limiter);
+app.use(mongoSanitize());
+app.use(cors());
 
 // ✅ Connect to MongoDB
 connectDB();
@@ -44,8 +56,7 @@ app.use('/api/agent', agentRoutes);
 app.use('/api/public', publicRoutes);
 app.use('/api/shipments', shipmentRoutes);
 app.use('/api/pricing', pricingRoutes);
-app.use('/api/track', trackingRoutes); // <-- added tracking route
-app.use("/api/tracking", trackingRoutes);
+app.use('/api/track', trackingRoutes);
 app.use('/api/invoices', invoiceRoutes);
 
 

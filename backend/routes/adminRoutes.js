@@ -1,14 +1,28 @@
+// backend/routes/adminRoutes.js
 import express from 'express';
-import { protect,isAdmin } from '../middleware/authMiddleware.js';
-import { createOrUpdatePricing, getAllPricing, getPricingByRoute,deletePricing } from '../controllers/adminController.js';
-import { assignAgentToShipment } from '../controllers/adminController.js';
+import { protect, isAdmin } from '../middleware/authMiddleware.js';
+
+// Pricing + dashboard + shipment admin ops live in adminController.js
+import {
+  createOrUpdatePricing,
+  getAllPricing,
+  getPricingByRoute,
+  deletePricing,
+  assignAgentToShipment,
+  getAllShipments,
+  getShipmentById,
+  getDashboardStats,
+} from '../controllers/adminController.js';
+
+// Admin user management endpoints
 import {
   getAllUsers,
   getUserById,
   updateUserRole,
   deleteUserById,
-} from '../controllers/adminUserController.js'; // we'll create this file next
+} from '../controllers/adminUserController.js';
 
+// Admin agent management endpoints
 import {
   createAgent,
   getAllAgents,
@@ -17,71 +31,57 @@ import {
   deleteAgent,
 } from '../controllers/adminAgentController.js';
 
-
-import {
-  getAllShipments,
-  getShipmentById,
-  updateShipmentStatus,
-} from '../controllers/adminController.js';
-
-import { getDashboardStats } from '../controllers/adminController.js';
-
+// New: pricing quote preview (admin GET) + shipment reprice
+import { adminQuotePreview } from '../controllers/pricingController.js';
+import { repriceShipment } from '../controllers/shipmentController.js';
 
 const router = express.Router();
 
-// Admin creates or updates a price
+/**
+ * Pricing management (Admin)
+ */
 router.post('/pricing', protect, isAdmin, createOrUpdatePricing);
-
-// Admin fetches all pricing data
-router.get('/pricing/all', protect, isAdmin, getAllPricing);
-
-// Admin fetches price for a specific route
+router.get('/pricing', protect, isAdmin, getAllPricing);
 router.get('/pricing/:fromProvince/:toProvince', protect, isAdmin, getPricingByRoute);
-
-// Admin deletes a pricing entry
 router.delete('/pricing/:fromProvince/:toProvince', protect, isAdmin, deletePricing);
 
+// NEW: Admin GET quote preview using query params
+// Example:
+//   GET /api/admin/pricing/quote?weightKg=2.5&pieces=1&serviceType=EXPRESS&zoneName=DOMESTIC&isCOD=true&codAmount=2500&length=30&width=20&height=15
+router.get('/pricing/quote', protect, isAdmin, adminQuotePreview);
 
-
-
-// ✅ Now protected
+/**
+ * Shipments (Admin)
+ */
 router.get('/shipments', protect, isAdmin, getAllShipments);
 router.get('/shipments/:id', protect, isAdmin, getShipmentById);
-router.put('/shipments/:id/status', protect, isAdmin, updateShipmentStatus);
 
-// 🔐 Add below shipment routes
+// Assign agent to a shipment
+router.put('/assign-agent', protect, isAdmin, assignAgentToShipment);
 
-// Agent Management
-router
-  .route('/agents')
-  .post(protect, isAdmin, createAgent)
-  .get(protect, isAdmin, getAllAgents);
+// NEW: Recompute charges for a shipment using current active pricing
+router.patch('/shipments/:id/reprice', protect, isAdmin, repriceShipment);
 
-router
-  .route('/agents/:id')
-  .get(protect, isAdmin, getAgentById)
-  .put(protect, isAdmin, updateAgent)
-  .delete(protect, isAdmin, deleteAgent);
-
-
-
-// GET all users
+/**
+ * Users (Admin)
+ */
 router.get('/users', protect, isAdmin, getAllUsers);
-
-// GET user by ID
 router.get('/users/:id', protect, isAdmin, getUserById);
-
-// PUT update user role
 router.put('/users/:id/role', protect, isAdmin, updateUserRole);
-
-// DELETE user by ID
 router.delete('/users/:id', protect, isAdmin, deleteUserById);
-// PUT assign agent to shipment
-// router.put('/shipments/:id/assign', assignAgentToShipment);
 
-router.put('/shipments/:id/assign-agent', protect, isAdmin, assignAgentToShipment);
+/**
+ * Agents (Admin)
+ */
+router.post('/agents', protect, isAdmin, createAgent);
+router.get('/agents', protect, isAdmin, getAllAgents);
+router.get('/agents/:id', protect, isAdmin, getAgentById);
+router.put('/agents/:id', protect, isAdmin, updateAgent);
+router.delete('/agents/:id', protect, isAdmin, deleteAgent);
 
-// 📊 GET /api/admin/dashboard
+/**
+ * Dashboard (Admin)
+ */
 router.get('/dashboard', protect, isAdmin, getDashboardStats);
 
 export default router;

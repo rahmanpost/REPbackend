@@ -1,89 +1,75 @@
+// backend/routes/userRoutes.js
 import express from 'express';
 import { protect, isAdmin, isAgent } from '../middleware/authMiddleware.js';
+
+// Auth endpoints (moved to dedicated controller)
 import {
   registerUser,
   loginUser,
+  forgotPassword,
+  resetPassword,
+} from '../controllers/authController.js';
+
+// User/profile/address endpoints remain in userController
+import {
   getUserById,
   getAllUsers,
   deleteUser,
   getUserProfile,
   updateUserProfile,
   setDefaultAddress,
-} from '../controllers/userController.js';
-import { forgotPassword, resetPassword } from '../controllers/userController.js';
-
-import {
   addAddress,
-  updateAddress,
-  deleteAddress,
-} from '../controllers/addressController.js';
+  uploadProfilePicture,
+} from '../controllers/userController.js';
+
+// Agent-related shipment status update
 import { updateShipmentStatus } from '../controllers/shipmentController.js';
-import { refreshAccessToken, logoutUser } from '../controllers/userController.js';
-import { authLimiter } from '../middleware/rateLimiter.js';
-import { requestEmailVerification, verifyEmail } from '../controllers/userController.js';
 
-
-
-
+// Upload (profile picture)
+import upload from '../middleware/uploadMiddleware.js';
 
 const router = express.Router();
 
-//
-// ✅ Public Routes
-//
-router.post('/login', loginUser);
+/**
+ * Auth
+ */
 router.post('/register', registerUser);
+router.post('/login', loginUser);
+router.post('/forgot-password', forgotPassword);
+router.post('/reset-password', resetPassword);
 
-
-// Apply rate limiting to login and register routes
-router.post('/login', authLimiter, loginUser);
-router.post('/forgot', authLimiter, forgotPassword);
-router.post('/reset/:token', authLimiter, resetPassword);
-
-router.post('/verify/request', requestEmailVerification);
-router.get('/verify/:token', verifyEmail);
-
-
-
-// forgot password
-router.post('/forgot', forgotPassword);
-//reset password
-router.post('/reset/:token', resetPassword);
-router.post('/refresh', refreshAccessToken);
-router.post('/logout', logoutUser);
-
-
-//
-// 🔐 Protected Routes (Logged-in user required)
-//
+/**
+ * Current user profile
+ */
 router.get('/profile', protect, getUserProfile);
 router.put('/profile', protect, updateUserProfile);
 
+/**
+ * Addresses
+ */
 router.post('/addresses', protect, addAddress);
-router.put('/addresses/:addrId', protect, updateAddress);
-router.delete('/addresses/:addrId', protect, deleteAddress);
-router.patch('/addresses/:index/default', protect, setDefaultAddress);
+router.put('/addresses/default/:addressId', protect, setDefaultAddress);
 
-//
-// 🔒 Admin-only Routes
-//
+/**
+ * Admin user management
+ */
 router.get('/', protect, isAdmin, getAllUsers);
 router.get('/:id', protect, isAdmin, getUserById);
 router.delete('/:id', protect, isAdmin, deleteUser);
 
-//
-// 🚚 Agent Route
-//
-router.put('/shipments/:id/update-status', isAgent, updateShipmentStatus);
-
-import { uploadProfilePicture } from '../controllers/userController.js';
-import upload from '../middleware/uploadMiddleware.js';
-
+/**
+ * Upload profile picture
+ */
 router.put(
   '/upload-profile',
   protect,
   upload.single('profilePicture'),
   uploadProfilePicture
 );
+
+/**
+ * Agent shipment operations (if you expose through /api/users)
+ */
+router.put('/shipments/:id/update-status', protect, isAgent, updateShipmentStatus);
 
 export default router;

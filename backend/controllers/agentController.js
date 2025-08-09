@@ -1,284 +1,248 @@
+// backend/controllers/agentController.js
+import mongoose from 'mongoose';
+import sanitizeHtml from 'sanitize-html';
 import Shipment from '../models/shipment.js';
+import TrackingLog from '../models/TrackingLog.js';
 
-// Get shipments assigned to this agent
+const clean = (v) =>
+  typeof v === 'string'
+    ? sanitizeHtml(v.trim(), { allowedTags: [], allowedAttributes: {} })
+    : v;
+
+const isObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
+
+/**
+ * @desc   Get shipments assigned to the logged-in agent (pickup or delivery)
+ * @route  GET /api/agent/shipments
+ * @access Private (agent)
+ */
 export const getAssignedShipments = async (req, res) => {
   try {
-    const shipments = await Shipment.find({ assignedAgent: req.user._id }).sort({ createdAt: -1 });
-    res.json(shipments);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
+    const agentId = req.user?._id;
+    const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '20', 10), 1), 100);
+    const skip = (page - 1) * limit;
+
+    const filter = {
+      $or: [{ pickupAgent: agentId }, { deliveryAgent: agentId }],
+    };
+
+    const [items, total] = await Promise.all([
+      Shipment.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+      Shipment.countDocuments(filter),
+    ]);
+
+    return res.json({
+      success: true,
+      data: items,
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
   }
 };
 
-
-// Agent updates shipment progress
-export const updateShipmentProgress = async (req, res) => {
-  try {
-    const shipment = await Shipment.findOne({
-      _id: req.params.id,
-      assignedAgent: req.user._id,
-    });
-
-    if (!shipment) {
-      return res.status(404).json({ message: 'Shipment not found or not assigned to you' });
-    }
-
-    const { status } = req.body;
-
-    // Optional: validate status values
-    shipment.status = status;
-    const updated = await shipment.save();
-
-    res.json({
-      message: 'Shipment status updated by agent',
-      status: updated.status,
-    });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
-
-// @desc    Agent confirms pickup of a shipment
-// @route   PUT /api/agent/shipments/:id/pickup
-// @access  Agent only
-export const confirmPickup = async (req, res) => {
-  try {
-    const shipment = await Shipment.findOne({
-      _id: req.params.id,
-      assignedAgent: req.user._id,
-    });
-
-    if (!shipment) {
-      return res.status(404).json({ message: 'Shipment not found or not assigned to you' });
-    }
-
-    shipment.status = 'picked-up';
-    shipment.pickupConfirmedAt = new Date(); // Optional: you can save confirmation timestamp
-    const updated = await shipment.save();
-
-    res.json({
-      message: 'Pickup confirmed',
-      shipment: updated,
-    });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
-
-
+/**
+ * @desc   Get deliveries for logged-in agent (convenience)
+ * @route  GET /api/agent/deliveries
+ * @access Private (agent)
+ */
 export const getMyDeliveries = async (req, res) => {
   try {
-    const deliveries = await Shipment.find({
-      deliveryAgent: req.user._id,
-      status: 'out_for_delivery',
-    }).sort({ createdAt: -1 });
-
-    res.json(deliveries);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
+    const agentId = req.user?._id;
+    const list = await Shipment.find({ deliveryAgent: agentId })
+      .sort({ createdAt: -1 })
+      .lean();
+    return res.json({ success: true, data: list });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
   }
 };
 
-
-// @desc    Agent confirms delivery of a shipment
-// @route   PUT /api/agent/shipments/:id/deliver
-// @access  Agent only
-export const confirmDelivery = async (req, res) => {
+/**
+ * @desc   Generic progress update by agent
+ * @route  PUT /api/agent/shipments/:id/progress
+ * @access Private (agent)
+ */
+export const updateShipmentProgress = async (req, res) => {
   try {
-    const shipment = await Shipment.findOne({
-      _id: req.params.id,
-      assignedAgent: req.user._id,
-    });
+    const { id } = req.params;
+    const { status, note, location } = req.body || {};
 
-    if (!shipment) {
-      return res.status(404).json({ message: 'Shipment not found or not assigned to you' });
+    if (!isObjectId(id)) return res.status(400).json({ success: false, message: 'Invalid shipment id' });
+    if (!status) return res.status(400).json({ success: false, message: 'Status is required' });
+
+    const shipment = await Shipment.findById(id);
+    if (!shipment) return res.status(404).json({ success: false, message: 'Shipment not found' });
+
+    // Ensure the agent is assigned to this shipment
+    const agentId = String(req.user._id);
+    const assigned =
+      String(shipment.pickupAgent || '') === agentId || String(shipment.deliveryAgent || '') === agentId;
+    if (!assigned) return res.status(403).json({ success: false, message: 'Not assigned to this shipment' });
+
+    shipment.status = clean(status);
+    if (location?.province || location?.district) {
+      shipment.lastLocation = {
+        province: clean(location?.province),
+        district: clean(location?.district),
+        geo: location?.geo,
+      };
+    }
+    if (note) {
+      shipment.notes = [shipment.notes, clean(note)].filter(Boolean).join('\n');
     }
 
-    // Only allow if shipment is already picked up
-    if (shipment.status !== 'picked-up' && shipment.status !== 'in-transit') {
-      return res.status(400).json({
-        message: `Cannot confirm delivery unless status is 'picked-up' or 'in-transit'`,
-      });
-    }
+    if (shipment.status === 'PickedUp') shipment.pickedUpAt = new Date();
+    if (shipment.status === 'Delivered') shipment.deliveredAt = new Date();
 
-    shipment.status = 'delivered';
-    shipment.deliveredAt = new Date(); // Optional field to track delivery timestamp
-    const updated = await shipment.save();
-
-    res.json({
-      message: 'Delivery confirmed',
-      shipment: updated,
-    });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
-
-// @desc    Agent updates delivery status
-// @route   PUT /api/agent/shipments/:id/deliver
-// @access  Agent only
-export const updateDeliveryStatus = async (req, res) => {
-  try {
-    const shipment = await Shipment.findOne({
-      _id: req.params.id,
-      deliveryAgent: req.user._id,  // ✅ updated from assignedAgent
-    });
-
-    if (!shipment) {
-      return res.status(404).json({ message: 'Shipment not found or not assigned to you' });
-    }
-
-    const { status } = req.body;
-
-    // ✅ updated valid status values
-    const validStatuses = ['delivered', 'delivery_failed', 'returned'];
-
-    if (!validStatuses.includes(status)) {
-      return res.status(400).json({ message: 'Invalid delivery status' });
-    }
-
-    shipment.status = status;
-    shipment.deliveryUpdatedAt = new Date();
-
-    if (status === 'delivered') {
-      shipment.deliveredAt = new Date();
-    }
-
-    const updated = await shipment.save();
-
-    res.json({
-      message: `Delivery status updated to '${status}'`,
-      shipment: updated,
-    });
-
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
-
-
-// @desc    Mark shipment as picked up
-// @route   PUT /api/agent/shipments/:id/pickup
-// @access  Agent only
-export const markShipmentPickedUp = async (req, res) => {
-  try {
-    const shipment = await Shipment.findById(req.params.id);
-
-    if (!shipment) {
-      return res.status(404).json({ message: 'Shipment not found' });
-    }
-
-    // Optional: Only allow assigned agent to do this
-    if (shipment.assignedAgent?.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Not authorized' });
-    }
-
-    shipment.status = 'picked-up';
-    const updated = await shipment.save();
-
-    res.json({
-      message: 'Shipment marked as picked up',
-      status: updated.status,
-    });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
-
-// @desc    Mark shipment as delivered or failed
-// @route   PUT /api/agent/shipments/:id/delivery-attempt
-// @access  Agent only
-export const markDeliveryAttempt = async (req, res) => {
-  try {
-    const { status } = req.body;
-
-    const allowed = ['delivered', 'delivery-failed'];
-    if (!allowed.includes(status)) {
-      return res.status(400).json({ message: 'Invalid status' });
-    }
-
-    const shipment = await Shipment.findById(req.params.id);
-    if (!shipment) {
-      return res.status(404).json({ message: 'Shipment not found' });
-    }
-
-    // Optional: Check if current agent is assigned
-    if (shipment.assignedAgent?.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Not authorized' });
-    }
-
-    shipment.status = status;
-    const updated = await shipment.save();
-
-    res.json({
-      message: `Shipment marked as ${status}`,
-      status: updated.status,
-    });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
-// @desc    Mark shipment as returning or returned-to-sender
-// @route   PUT /api/agent/shipments/:id/return-status
-// @access  Agent only
-export const markReturnStatus = async (req, res) => {
-  try {
-    const { status } = req.body;
-
-    const allowed = ['returning', 'returned-to-sender'];
-    if (!allowed.includes(status)) {
-      return res.status(400).json({ message: 'Invalid return status' });
-    }
-
-    const shipment = await Shipment.findById(req.params.id);
-    if (!shipment) {
-      return res.status(404).json({ message: 'Shipment not found' });
-    }
-
-    // Optional: Check authorization
-    if (shipment.assignedAgent?.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Not authorized to update return status' });
-    }
-
-    shipment.status = status;
-    const updated = await shipment.save();
-
-    res.json({
-      message: `Shipment marked as ${status}`,
-      status: updated.status,
-    });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
-
-
-
-// @desc    Mark shipment as returning to sender
-// @route   PUT /api/agent/shipments/:id/return
-export const markAsReturning = async (req, res) => {
-  try {
-    const shipment = await Shipment.findById(req.params.id);
-
-    if (!shipment) {
-      return res.status(404).json({ message: 'Shipment not found' });
-    }
-
-    // You could also check if shipment.status === 'delivery-failed' first
-    shipment.status = 'returning';
     await shipment.save();
 
-    res.status(200).json({ message: 'Shipment marked as returning' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+    await TrackingLog.create({
+      shipment: shipment._id,
+      status: shipment.status,
+      message: clean(note),
+      location: {
+        province: clean(location?.province),
+        district: clean(location?.district),
+      },
+      createdBy: req.user._id,
+    });
+
+    return res.json({ success: true, message: 'Progress updated', data: { status: shipment.status } });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
   }
 };
 
+/**
+ * @desc   Confirm pickup
+ * @route  PUT /api/agent/shipments/:id/confirm-pickup
+ * @access Private (agent)
+ */
+export const confirmPickup = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isObjectId(id)) return res.status(400).json({ success: false, message: 'Invalid shipment id' });
 
+    const shipment = await Shipment.findById(id);
+    if (!shipment) return res.status(404).json({ success: false, message: 'Shipment not found' });
+
+    shipment.status = 'PickedUp';
+    shipment.pickedUpAt = new Date();
+    await shipment.save();
+
+    await TrackingLog.create({
+      shipment: shipment._id,
+      status: 'PickedUp',
+      message: 'Pickup confirmed',
+      createdBy: req.user._id,
+    });
+
+    return res.json({ success: true, message: 'Pickup confirmed' });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
+  }
+};
+
+/**
+ * @desc   Confirm delivery
+ * @route  PUT /api/agent/shipments/:id/confirm-delivery
+ * @access Private (agent)
+ */
+export const confirmDelivery = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isObjectId(id)) return res.status(400).json({ success: false, message: 'Invalid shipment id' });
+
+    const shipment = await Shipment.findById(id);
+    if (!shipment) return res.status(404).json({ success: false, message: 'Shipment not found' });
+
+    shipment.status = 'Delivered';
+    shipment.deliveredAt = new Date();
+    await shipment.save();
+
+    await TrackingLog.create({
+      shipment: shipment._id,
+      status: 'Delivered',
+      message: 'Delivery confirmed',
+      createdBy: req.user._id,
+    });
+
+    return res.json({ success: true, message: 'Delivery confirmed' });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
+  }
+};
+
+/**
+ * @desc   Update delivery status (custom)
+ * @route  PUT /api/agent/shipments/:id/delivery-status
+ * @access Private (agent)
+ */
+export const updateDeliveryStatus = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, note } = req.body || {};
+    if (!isObjectId(id)) return res.status(400).json({ success: false, message: 'Invalid shipment id' });
+    if (!status) return res.status(400).json({ success: false, message: 'Status is required' });
+
+    const shipment = await Shipment.findById(id);
+    if (!shipment) return res.status(404).json({ success: false, message: 'Shipment not found' });
+
+    shipment.status = clean(status);
+    if (note) shipment.notes = [shipment.notes, clean(note)].filter(Boolean).join('\n');
+    await shipment.save();
+
+    await TrackingLog.create({
+      shipment: shipment._id,
+      status: shipment.status,
+      message: clean(note),
+      createdBy: req.user._id,
+    });
+
+    return res.json({ success: true, message: 'Delivery status updated' });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
+  }
+};
+
+/**
+ * @desc   Mark shipment picked up (alternate endpoint)
+ * @route  PUT /api/agent/shipments/:id/picked-up
+ * @access Private (agent)
+ */
+export const markShipmentPickedUp = async (req, res) => {
+  req.params.id && (req.body.status = 'PickedUp');
+  return updateShipmentProgress(req, res);
+};
+
+/**
+ * @desc   Record a delivery attempt
+ * @route  PUT /api/agent/shipments/:id/delivery-attempt
+ * @access Private (agent)
+ */
+export const markDeliveryAttempt = async (req, res) => {
+  req.params.id && (req.body.status = 'DeliveryAttempted');
+  return updateShipmentProgress(req, res);
+};
+
+/**
+ * @desc   Mark as returned/returning
+ * @route  PUT /api/agent/shipments/:id/return-status
+ * @access Private (agent)
+ */
+export const markReturnStatus = async (req, res) => {
+  req.params.id && (req.body.status = 'Returned');
+  return updateShipmentProgress(req, res);
+};
+
+/**
+ * @desc   Explicitly switch to a "Returning" state
+ * @route  PUT /api/agent/shipments/:id/return
+ * @access Private (agent)
+ */
+export const markAsReturning = async (req, res) => {
+  req.params.id && (req.body.status = 'Returning');
+  return updateShipmentProgress(req, res);
+};

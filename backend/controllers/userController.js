@@ -1,362 +1,219 @@
+import mongoose from 'mongoose';
+import sanitizeHtml from 'sanitize-html';
 import User from '../models/User.js';
-import crypto from 'crypto';
-import jwt from 'jsonwebtoken';
-import generateToken from '../utils/generateJWT.js'; // assumed to be your own JWT utility
 
+const { isValid: isValidObjectId } = mongoose.Types.ObjectId;
 
+/** Helpers */
+const cleanStr = (v) =>
+  typeof v === 'string'
+    ? sanitizeHtml(v.trim(), { allowedTags: [], allowedAttributes: {} })
+    : v;
 
-// @desc   Middleware to protect routes
-export const protect = async (req, res, next) => {
-  let token = req.headers.authorization?.split(' ')[1];
+const userSafeProjection = '-password -__v';
 
-  if (!token) {
-    return res.status(401).json({ message: 'Not authorized, token missing' });
-  }
-
+/**
+ * @desc   Get current user's profile
+ * @route  GET /api/users/profile
+ * @access Private (protect)
+ */
+export const getUserProfile = async (req, res) => {
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = await User.findById(decoded.id).select('-password');
-    next();
-  } catch (error) {
-    res.status(401).json({ message: 'Not authorized, token failed' });
-  }
-};
-// @desc   Register a new user
-// @route  POST /api/users/register
-export const registerUser = async (req, res) => {
-  
-  try {
-    const { fullName, phoneNumber, email, password } = req.body;
-
-    if (!fullName || !phoneNumber || !password) {
-      return res.status(400).json({ message: 'Full name, phone number, and password are required' });
+    const user = await User.findById(req.user?._id).select(userSafeProjection);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
     }
-
-    const userExists = await User.findOne({ phoneNumber });
-    if (userExists) {
-      return res.status(400).json({ message: 'User already exists with this phone number' });
-    }
-
-    const user = await User.create({
-      fullName,
-      phoneNumber,
-      email,
-      password, // hashed via pre-save middleware
-    });
-
-    res.status(201).json({
-      _id: user._id,
-      fullName: user.fullName,
-      phoneNumber: user.phoneNumber,
-      role: user.role,
-      token: generateToken(user._id),
-    });
-
-  } catch (error) {
-    console.error('Register Error:', error);
-    res.status(500).json({ error: error.message });
+    return res.json({ success: true, data: user });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
   }
 };
 
-// @desc   Login user
-// @route  POST /api/users/login/resetpassword using JWT
-
-
-const generateAccessToken = (userId) => {
-  return jwt.sign({ id: userId }, process.env.JWT_SECRET, {
-    expiresIn: '15m', // short-lived
-  });
-};
-
-const generateRefreshToken = (userId) => {
-  return jwt.sign({ id: userId }, process.env.JWT_SECRET, {
-    expiresIn: '7d', // long-lived
-  });
-};
-
-
-// Placeholder: request email verification
-export const requestEmailVerification = async (req, res) => {
-  res.json({ message: 'Verification token would be emailed (not implemented).' });
-};
-
-// Placeholder: verify email with token
-export const verifyEmail = async (req, res) => {
-  res.json({ message: 'Email verified successfully (not implemented).' });
-};
-
-
-export const loginUser = async (req, res) => {
-  const { email, password } = req.body;
-
+/**
+ * @desc   Update current user's profile (name/email/phone/password)
+ * @route  PUT /api/users/profile
+ * @access Private (protect)
+ */
+export const updateUserProfile = async (req, res) => {
   try {
-    const user = await User.findOne({ email });
-    if (!user || !(await user.matchPassword(password))) {
-      return res.status(401).json({ message: 'Invalid credentials' });
+    const user = await User.findById(req.user?._id);
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
     }
 
-    const accessToken = generateAccessToken(user._id);
-    const refreshToken = generateRefreshToken(user._id);
+    const { fullName, email, phone, password } = req.body || {};
 
-    // Set refresh token as HTTP-only cookie
-    res.cookie('refreshToken', refreshToken, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'Strict',
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    if (fullName !== undefined) user.fullName = cleanStr(fullName);
+    if (email !== undefined) user.email = cleanStr(email).toLowerCase();
+    if (phone !== undefined) user.phone = cleanStr(phone);
+    if (password) user.password = password; // will hash via pre('save')
+
+    await user.save();
+    const safe = await User.findById(user._id).select(userSafeProjection);
+    return res.json({ success: true, message: 'Profile updated', data: safe });
+  } catch (err) {
+    // Handle duplicate phone/email nicely
+    if (err?.code === 11000) {
+      return res.status(409).json({ success: false, message: 'Phone already in use' });
+    }
+    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
+  }
+};
+
+/**
+ * @desc   Add an address to current user
+ * @route  POST /api/users/addresses
+ * @access Private (protect)
+ */
+export const addAddress = async (req, res) => {
+  try {
+    const u = await User.findById(req.user?._id);
+    if (!u) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const addr = {
+      province: cleanStr(req.body?.province),
+      district: cleanStr(req.body?.district),
+      street: cleanStr(req.body?.street),
+      details: cleanStr(req.body?.details),
+      isDefault: !!req.body?.isDefault,
+    };
+
+    // If first address, make it default
+    if (!u.addresses || u.addresses.length === 0) addr.isDefault = true;
+
+    u.addresses.push(addr);
+    await u.save();
+
+    return res.status(201).json({
+      success: true,
+      message: 'Address added',
+      data: u.addresses,
     });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
+  }
+};
 
-    res.json({
-      accessToken,
-      user: {
-        _id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
+/**
+ * @desc   Set default address by addressId
+ * @route  PUT /api/users/addresses/default/:addressId
+ * @access Private (protect)
+ */
+export const setDefaultAddress = async (req, res) => {
+  try {
+    const { addressId } = req.params;
+    const u = await User.findById(req.user?._id);
+    if (!u) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const idx = u.addresses.findIndex((a) => String(a._id) === String(addressId));
+    if (idx === -1) {
+      return res.status(404).json({ success: false, message: 'Address not found' });
+    }
+
+    // Clear previous defaults and set new one
+    u.addresses = u.addresses.map((a, i) => ({ ...a.toObject(), isDefault: i === idx }));
+    await u.save();
+
+    return res.json({ success: true, message: 'Default address updated', data: u.addresses });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
+  }
+};
+
+/**
+ * @desc   Get all users (admin)
+ * @route  GET /api/users
+ * @access Private/Admin
+ */
+export const getAllUsers = async (req, res) => {
+  try {
+    // Basic pagination
+    const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '20', 10), 1), 100);
+    const skip = (page - 1) * limit;
+
+    const [items, total] = await Promise.all([
+      User.find({})
+        .select(userSafeProjection)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      User.countDocuments({}),
+    ]);
+
+    return res.json({
+      success: true,
+      data: items,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit),
       },
     });
   } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-};
-// refresh token Access
-export const refreshAccessToken = (req, res) => {
-  const token = req.cookies.refreshToken;
-
-  if (!token) {
-    return res.status(401).json({ message: 'No refresh token provided' });
-  }
-
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const accessToken = jwt.sign({ id: decoded.id }, process.env.JWT_SECRET, {
-      expiresIn: '15m',
-    });
-
-    res.json({ accessToken });
-  } catch (err) {
-    res.status(403).json({ message: 'Invalid refresh token' });
+    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
   }
 };
 
-//logout user
-export const logoutUser = (req, res) => {
-  res.clearCookie('refreshToken', {
-    httpOnly: true,
-    sameSite: 'Strict',
-    secure: process.env.NODE_ENV === 'production',
-  });
-  res.json({ message: 'Logged out' });
-};
-
-
-
-// @desc   Forgot password
-// @route  POST /api/users/forgot-password
-
-export const forgotPassword = async (req, res) => {
-  const { email } = req.body;
-
-  try {
-    const user = await User.findOne({ email });
-    if (!user)
-      return res.status(404).json({ message: 'User not found' });
-
-    const resetToken = user.generatePasswordResetToken();
-    await user.save({ validateBeforeSave: false });
-
-    const resetUrl = `${req.protocol}://${req.get('host')}/api/users/reset/${resetToken}`;
-
-    // TODO: send email in real use; for now return the token
-    res.json({ message: 'Reset link generated', resetUrl });
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-};
-
-//reset password
-export const resetPassword = async (req, res) => {
-  const hashedToken = crypto
-    .createHash('sha256')
-    .update(req.params.token)
-    .digest('hex');
-
-  try {
-    const user = await User.findOne({
-      resetPasswordToken: hashedToken,
-      resetPasswordExpire: { $gt: Date.now() },
-    });
-
-    if (!user)
-      return res.status(400).json({ message: 'Invalid or expired token' });
-
-    user.password = req.body.password;
-    user.resetPasswordToken = undefined;
-    user.resetPasswordExpire = undefined;
-
-    await user.save();
-    res.json({ message: 'Password reset successful' });
-  } catch (err) {
-    res.status(500).json({ message: 'Server error' });
-  }
-};
-
-
-
-
-// @desc   Get all users (admin only)
-// @route  GET /api/users
-export const getAllUsers = async (req, res) => {
-  try {
-    const users = await User.find().select('-password');
-    res.status(200).json(users);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
-// @desc   Get user by ID
-// @route  GET /api/users/:id
+/**
+ * @desc   Get user by ID (admin)
+ * @route  GET /api/users/:id
+ * @access Private/Admin
+ */
 export const getUserById = async (req, res) => {
   try {
-    const user = await User.findById(req.params.id).select('-password');
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    res.status(200).json(user);
-  } catch (error) {
-    res.status(500).json({ message: error.message });
+    const { id } = req.params;
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
+    }
+    const user = await User.findById(id).select(userSafeProjection);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.json({ success: true, data: user });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
   }
 };
 
-// @desc   Delete user
-// @route  DELETE /api/users/:id
+/**
+ * @desc   Delete user (admin)
+ * @route  DELETE /api/users/:id
+ * @access Private/Admin
+ */
 export const deleteUser = async (req, res) => {
   try {
-    const user = await User.findByIdAndDelete(req.params.id);
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    res.status(200).json({ message: 'User deleted successfully' });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
-
-
-// @desc    Get user profile
-// @route   GET /api/users/profile
-// @access  Private
-export const getUserProfile = async (req, res) => {
-  try {
-    const user = req.user;
-    if (!user) {
-      return res.status(404).json({ message: 'User not found' });
+    const { id } = req.params;
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
     }
-
-    res.json({
-      _id: user._id,
-      fullName: user.fullName,
-      phoneNumber: user.phoneNumber,
-      role: user.role,
-      email: user.email,
-      addresses: user.addresses,
-      createdAt: user.createdAt,
-      updatedAt: user.updatedAt,
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+    const del = await User.findByIdAndDelete(id);
+    if (!del) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.json({ success: true, message: 'User deleted' });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
   }
 };
 
-// @desc    Update user profile
-// @route   PUT /api/users/profile
-// @access  Private
-export const updateUserProfile = async (req, res) => {
-  const user = await User.findById(req.user._id);
-
-  if (!user) {
-    return res.status(404).json({ message: 'User not found' });
-  }
-
-  const { fullName, email, password } = req.body;
-  if (fullName) user.fullName = fullName;
-  if (email) user.email = email;
-  if (password) user.password = password;
-
-  const updatedUser = await user.save();
-
-  res.json({
-    _id: updatedUser._id,
-    fullName: updatedUser.fullName,
-    phoneNumber: updatedUser.phoneNumber,
-    email: updatedUser.email,
-    role: updatedUser.role,
-    token: generateToken(updatedUser._id),
-  });
-};
-
-// @desc    Add a new address
-// @route   POST /api/users/addresses
-// @access  Private
-export const addAddress = async (req, res) => {
-  try {
-    const user = await User.findById(req.user._id);
-    user.addresses.push(req.body);
-    await user.save();
-    res.status(201).json({ message: 'Address added', addresses: user.addresses });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
-// @desc    Update an existing address
-// @route   PUT /api/users/addresses/:index
-// @access  Private
-export const updateAddress = async (req, res) => {
-  try {
-    const user = await User.findById(req.user._id);
-    user.addresses[req.params.index] = req.body;
-    await user.save();
-    res.json({ message: 'Address updated', addresses: user.addresses });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
-// @desc    Set default address
-// @route   PATCH /api/users/addresses/:index/default
-// @access  Private
-export const setDefaultAddress = async (req, res) => {
-  try {
-    const user = await User.findById(req.user._id);
-
-    user.addresses.forEach((addr) => (addr.isDefault = false));
-
-    const index = req.params.index;
-    if (!user.addresses[index]) {
-      return res.status(404).json({ message: 'Address not found' });
-    }
-
-    user.addresses[index].isDefault = true;
-    await user.save();
-
-    res.json({ message: 'Default address set', addresses: user.addresses });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-};
-
+/**
+ * @desc   Upload profile picture (multer provides req.file)
+ * @route  PUT /api/users/upload-profile
+ * @access Private
+ */
 export const uploadProfilePicture = async (req, res) => {
   try {
-    const user = await User.findById(req.user._id);
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: 'No file uploaded' });
+    }
+    const user = await User.findById(req.user?._id);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    user.profilePicture = req.file.path;
+    user.profilePicture = req.file.path; // adjust if you store URLs
     await user.save();
 
-    res.status(200).json({ message: 'Profile picture uploaded', user });
+    const safe = await User.findById(user._id).select(userSafeProjection);
+    return res.json({ success: true, message: 'Profile picture uploaded', data: safe });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
   }
 };

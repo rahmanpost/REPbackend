@@ -1,28 +1,34 @@
+// backend/routes/shipmentRoutes.js
 import express from 'express';
-import { protect } from '../middleware/authMiddleware.js';
+import { protect, isAgent } from '../middleware/authMiddleware.js';
+import upload from '../middleware/uploadMiddleware.js';
 
-import { 
+import {
   createShipment,
   getMyShipments,
   cancelShipment,
-  getShipmentByIdForUser
-} from '../controllers/shipmentController.js';
-import {
+  getShipmentByIdForUser,
   uploadShipmentFiles,
 } from '../controllers/shipmentController.js';
 
-import upload from '../middleware/uploadMiddleware.js';
-import { isAgent } from '../middleware/authMiddleware.js';
+import { downloadInvoice } from '../controllers/invoiceController.js';
 
 const router = express.Router();
 
-router.post('/', protect, createShipment);
-router.get('/my', protect, getMyShipments);
-router.get('/my-shipments', protect, getMyShipments);    // changed from '/' to '/my-shipments'
-router.put('/:id/cancel', protect, cancelShipment);
-router.get('/:id', protect, getShipmentByIdForUser);
+/**
+ * User shipment CRUD
+ */
+router.post('/shipments', protect, createShipment);
+router.get('/shipments/my', protect, getMyShipments);
+router.get('/shipments/:id', protect, getShipmentByIdForUser);
+router.delete('/shipments/:id', protect, cancelShipment);
+
+/**
+ * Agent uploads shipment-related files/photos
+ * Fields supported: beforePhoto, afterPhoto, receipt
+ */
 router.put(
-  '/:id/upload',
+  '/shipments/:id/files',
   protect,
   isAgent,
   upload.fields([
@@ -33,5 +39,10 @@ router.put(
   uploadShipmentFiles
 );
 
+/**
+ * Invoice download (kept both paths for backward compatibility)
+ */
+router.get('/shipments/:id/invoice', protect, downloadInvoice);
+router.get('/:id/invoice', protect, downloadInvoice);
 
 export default router;

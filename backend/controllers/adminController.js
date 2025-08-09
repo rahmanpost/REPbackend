@@ -1,264 +1,246 @@
+// backend/controllers/adminController.js
+import mongoose from 'mongoose';
+import sanitizeHtml from 'sanitize-html';
 import Shipment from '../models/shipment.js';
 import User from '../models/User.js';
 import Pricing from '../models/pricing.js';
+import TrackingLog from '../models/TrackingLog.js';
+
+const clean = (v) =>
+  typeof v === 'string'
+    ? sanitizeHtml(v.trim(), { allowedTags: [], allowedAttributes: {} })
+    : v;
+
+const isObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
+
+/* ----------------------------- PRICING ADMIN ----------------------------- */
 
 // Create or update pricing for a route
 export const createOrUpdatePricing = async (req, res) => {
-  const { fromProvince, toProvince, price } = req.body;
-
-  if (!fromProvince || !toProvince || price == null) {
-    return res.status(400).json({ message: 'Missing required fields' });
-  }
-
   try {
-    const pricing = await Pricing.findOneAndUpdate(
+    const fromProvince = clean(req.body?.fromProvince)?.toLowerCase();
+    const toProvince = clean(req.body?.toProvince)?.toLowerCase();
+    const price = Number(req.body?.price);
+
+    if (!fromProvince || !toProvince || !Number.isFinite(price)) {
+      return res.status(400).json({ success: false, message: 'fromProvince, toProvince, price are required' });
+    }
+
+    const doc = await Pricing.findOneAndUpdate(
       { fromProvince, toProvince },
-      { price },
+      { fromProvince, toProvince, price, currency: req.body?.currency || 'AFN' },
       { new: true, upsert: true }
     );
 
-    res.json({ message: 'Pricing saved successfully', pricing });
+    return res.json({ success: true, message: 'Pricing saved', data: doc });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    const conflict = error?.code === 11000;
+    return res.status(conflict ? 409 : 500).json({
+      success: false,
+      message: conflict ? 'Pricing already exists for this route' : 'Server error',
+      error: error.message,
+    });
   }
 };
 
-// Get all pricing
-export const getAllPricing = async (req, res) => {
+// List all pricing (simple, admin view)
+export const getAllPricing = async (_req, res) => {
   try {
-    const pricing = await Pricing.find().sort({ fromProvince: 1, toProvince: 1 });
-    res.json(pricing);
+    const list = await Pricing.find({}).sort({ fromProvince: 1, toProvince: 1 }).lean();
+    return res.json({ success: true, data: list });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message });
   }
 };
 
-// Get price for specific route
+// Get single pricing by path params
 export const getPricingByRoute = async (req, res) => {
-  const { fromProvince, toProvince } = req.params;
-
   try {
-    const pricing = await Pricing.findOne({ fromProvince, toProvince });
-    if (!pricing) {
-      return res.status(404).json({ message: 'Pricing not found for this route' });
+    const fromProvince = clean(req.params?.fromProvince)?.toLowerCase();
+    const toProvince = clean(req.params?.toProvince)?.toLowerCase();
+
+    if (!fromProvince || !toProvince) {
+      return res.status(400).json({ success: false, message: 'fromProvince and toProvince are required' });
     }
-    res.json(pricing);
+
+    const priceDoc = await Pricing.findOne({ fromProvince, toProvince }).lean();
+    if (!priceDoc) return res.status(404).json({ success: false, message: 'No pricing for this route' });
+
+    return res.json({ success: true, data: priceDoc });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message });
   }
 };
 
 // Delete pricing for a specific route
 export const deletePricing = async (req, res) => {
-  const { fromProvince, toProvince } = req.params;
-
   try {
-    const result = await Pricing.findOneAndDelete({ fromProvince, toProvince });
-    if (!result) {
-      return res.status(404).json({ message: 'Pricing not found to delete' });
-    }
-    res.json({ message: 'Pricing deleted successfully' });
+    const fromProvince = clean(req.params?.fromProvince)?.toLowerCase();
+    const toProvince = clean(req.params?.toProvince)?.toLowerCase();
+
+    const del = await Pricing.findOneAndDelete({ fromProvince, toProvince });
+    if (!del) return res.status(404).json({ success: false, message: 'Pricing not found' });
+
+    return res.json({ success: true, message: 'Pricing deleted' });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message });
   }
 };
 
+/* ---------------------------- SHIPMENT ADMIN ----------------------------- */
 
-
-
-// @desc    Get all shipments (with optional filters)
-// @route   GET /api/admin/shipments
-// @access  Admin only
+// List shipments with optional filters + pagination
 export const getAllShipments = async (req, res) => {
   try {
-    const { status, agentId, customerEmail, keyword } = req.query;
+    const {
+      status,
+      agentId,          // pickup or delivery agent id
+      customerPhone,    // by sender phone
+      trackingId,
+      fromProvince,
+      toProvince,
+      page = '1',
+      limit = '20',
+    } = req.query;
 
-    let filter = {};
+    const filter = {};
 
-    if (status) filter.status = status;
-    if (agentId) filter.assignedAgent = agentId;
-
-    // 🔍 Search by keyword (sender/receiver name or phone)
-    if (keyword) {
+    if (status) filter.status = clean(status);
+    if (trackingId) filter.trackingId = clean(trackingId);
+    if (fromProvince) filter['from.province'] = clean(fromProvince);
+    if (toProvince) filter['to.province'] = clean(toProvince);
+    if (agentId && isObjectId(agentId)) {
       filter.$or = [
-        { senderName: { $regex: keyword, $options: 'i' } },
-        { receiverName: { $regex: keyword, $options: 'i' } },
-        { senderPhone: { $regex: keyword, $options: 'i' } },
-        { receiverPhone: { $regex: keyword, $options: 'i' } }
+        { pickupAgent: new mongoose.Types.ObjectId(agentId) },
+        { deliveryAgent: new mongoose.Types.ObjectId(agentId) },
       ];
     }
-
-    // 🎯 Filter by customer email (find user by email)
-    if (customerEmail) {
-      const user = await User.findOne({ email: customerEmail });
-      if (user) {
-        filter.user = user._id;
-      } else {
-        return res.status(404).json({ message: 'Customer not found' });
-      }
+    if (customerPhone) {
+      // resolve sender by phone
+      const sender = await User.findOne({ phone: clean(customerPhone) }).select('_id');
+      if (sender) filter.sender = sender._id; else filter.sender = '__none__'; // no results
     }
 
-    const shipments = await Shipment.find(filter)
-      .populate('sender', 'name email')
-      .populate('agent', 'name email');
+    const pageN = Math.max(parseInt(page, 10) || 1, 1);
+    const limitN = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+    const skip = (pageN - 1) * limitN;
 
-    res.json(shipments);
-  } catch (error) {
-    console.error('Failed to fetch shipments:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-};
-
-
-// @desc    Get a shipment by ID (admin only)
-// @route   GET /api/admin/shipments/:id
-// @access  Admin
-export const getShipmentById = async (req, res) => {
-  try {
-    const shipment = await Shipment.findById(req.params.id);
-    if (!shipment) {
-      return res.status(404).json({ message: 'Shipment not found' });
-    }
-    res.json(shipment);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
-  }
-};
-
-// @desc    Update shipment status (admin only)
-// @route   PUT /api/admin/shipments/:id/status
-// @access  Admin
-export const updateShipmentStatus = async (req, res) => {
-  try {
-    const shipment = await Shipment.findById(req.params.id);
-    if (!shipment) {
-      return res.status(404).json({ message: 'Shipment not found' });
-    }
-
-    const { status } = req.body;
-
-    // ✅ Validate status input to prevent invalid updates
-    const allowedStatuses = [
-      'pickup-scheduled',
-      'picked-up',
-      'origin-hub',
-      'in-transit',
-      'delivery-failed',
-      'returning',
-      'delivered',
-      'returned-to-sender',
-      'cancelled',
-    ];
-
-    if (!allowedStatuses.includes(status)) {
-      return res.status(400).json({ message: 'Invalid status value' });
-    }
-
-    shipment.status = status;
-    const updated = await shipment.save();
-
-    res.json({
-      message: 'Shipment status updated successfully',
-      status: updated.status,
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-};
-
-
-// backend/controllers/adminController.js
-export const getAdminStats = async (req, res) => {
-  try {
-    const totalShipments = await Shipment.countDocuments();
-    const delivered = await Shipment.countDocuments({ status: 'delivered' });
-    const inTransit = await Shipment.countDocuments({ status: 'in-transit' });
-
-    res.json({ totalShipments, delivered, inTransit });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-};
-
-
-
-export const assignAgentToShipment = async (req, res) => {
-  try {
-    const shipment = await Shipment.findById(req.params.id);
-    if (!shipment) return res.status(404).json({ message: 'Shipment not found' });
-
-    const { agentId } = req.body;
-    const agent = await User.findById(agentId);
-
-    if (!agent || agent.role !== 'agent') {
-      return res.status(400).json({ message: 'Invalid agent user' });
-    }
-
-    shipment.agent = agentId;
-    await shipment.save();
-
-    res.status(200).json({
-      message: 'Agent assigned to shipment',
-      shipmentId: shipment._id,
-      agentId: agent._id,
-    });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
-  }
-};
-
-
-// @desc    Get dashboard stats
-// @route   GET /api/admin/dashboard
-// @access  Admin only
-export const getDashboardStats = async (req, res) => {
-  try {
-    const [
-      totalShipments,
-      delivered,
-      pending,
-      returned,
-      cancelled,
-      totalUsers,
-      totalAgents
-    ] = await Promise.all([
-      Shipment.countDocuments({}),
-      Shipment.countDocuments({ status: 'Delivered' }),
-      Shipment.countDocuments({ status: 'Pending' }),
-      Shipment.countDocuments({ status: 'Returned' }),
-      Shipment.countDocuments({ status: 'Cancelled' }),
-      User.countDocuments({}),
-      User.countDocuments({ role: 'agent' }),
+    const [items, total] = await Promise.all([
+      Shipment.find(filter)
+        .populate('pickupAgent', 'fullName phone role')
+        .populate('deliveryAgent', 'fullName phone role')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limitN)
+        .lean(),
+      Shipment.countDocuments(filter),
     ]);
 
-    res.json({
-      totalShipments,
-      delivered,
-      pending,
-      returned,
-      cancelled,
-      totalUsers,
-      totalAgents,
+    return res.json({
+      success: true,
+      data: items,
+      pagination: { page: pageN, limit: limitN, total, pages: Math.ceil(total / limitN) },
     });
   } catch (error) {
-    console.error('Dashboard stats error:', error);
-    res.status(500).json({ message: 'Server error' });
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message });
   }
 };
 
-export const getAllUsers = async (req, res) => {
+// Get a single shipment (admin)
+export const getShipmentById = async (req, res) => {
   try {
-    const { role } = req.query;
+    const { id } = req.params;
+    if (!isObjectId(id)) return res.status(400).json({ success: false, message: 'Invalid shipment id' });
 
-    const filter = role ? { role } : {};
+    const doc = await Shipment.findById(id)
+      .populate('pickupAgent', 'fullName phone role')
+      .populate('deliveryAgent', 'fullName phone role')
+      .lean();
 
-    const users = await User.find(filter).select('-password');
+    if (!doc) return res.status(404).json({ success: false, message: 'Shipment not found' });
 
-    res.json(users);
+    return res.json({ success: true, data: doc });
   } catch (error) {
-    console.error('Failed to fetch users:', error);
-    res.status(500).json({ message: 'Server error' });
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message });
+  }
+};
+
+// Assign agent to a shipment (either pickup or delivery)
+export const assignAgentToShipment = async (req, res) => {
+  try {
+    const { shipmentId, agentId, type } = req.body || {};
+    if (!isObjectId(shipmentId) || !isObjectId(agentId) || !['pickup', 'delivery'].includes(type)) {
+      return res.status(400).json({ success: false, message: 'shipmentId, agentId, and type (pickup|delivery) are required' });
+    }
+
+    const agent = await User.findById(agentId);
+    if (!agent || agent.role !== 'agent') {
+      return res.status(400).json({ success: false, message: 'Agent not found or not an agent' });
+    }
+
+    const shipment = await Shipment.findById(shipmentId);
+    if (!shipment) return res.status(404).json({ success: false, message: 'Shipment not found' });
+
+    if (type === 'pickup') shipment.pickupAgent = agent._id;
+    else shipment.deliveryAgent = agent._id;
+
+    await shipment.save();
+
+    await TrackingLog.create({
+      shipment: shipment._id,
+      status: 'AgentAssigned',
+      message: `Assigned ${type} agent: ${agent.fullName || agent._id}`,
+      createdBy: req.user?._id,
+    });
+
+    return res.json({ success: true, message: `Assigned ${type} agent`, data: { shipmentId: shipment._id, agentId: agent._id, type } });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message });
+  }
+};
+
+/* ------------------------------ DASHBOARD -------------------------------- */
+
+// Simple stats for admin dashboard
+export const getDashboardStats = async (_req, res) => {
+  try {
+    const [
+      totalUsers,
+      totalAgents,
+      totalShipments,
+      createdToday,
+      deliveredTotal,
+      inTransit,
+      pricingRoutes,
+    ] = await Promise.all([
+      User.countDocuments({}),
+      User.countDocuments({ role: 'agent' }),
+      Shipment.countDocuments({}),
+      Shipment.countDocuments({
+        createdAt: {
+          $gte: new Date(new Date().setHours(0, 0, 0, 0)),
+          $lt: new Date(new Date().setHours(24, 0, 0, 0)),
+        },
+      }),
+      Shipment.countDocuments({ status: 'Delivered' }),
+      Shipment.countDocuments({ status: { $in: ['PickedUp', 'InTransit', 'OutForDelivery'] } }),
+      Pricing.countDocuments({}),
+    ]);
+
+    return res.json({
+      success: true,
+      data: {
+        users: { total: totalUsers, agents: totalAgents },
+        shipments: {
+          total: totalShipments,
+          today: createdToday,
+          delivered: deliveredTotal,
+          inTransit,
+        },
+        pricingRoutes,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: 'Server error', error: error.message });
   }
 };

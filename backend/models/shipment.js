@@ -1,161 +1,187 @@
 import mongoose from 'mongoose';
 
-import sanitizeHtml from 'sanitize-html';
+const { Schema } = mongoose;
 
+const money = { type: Number, min: 0, default: 0 };
 
-
-const shipmentSchema = new mongoose.Schema(
+/**
+ * Address block used for sender/receiver
+ */
+const addressBlockSchema = new Schema(
   {
-    sender: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
-      required: true,
-    },
-    price: {
-  type: Number,
-  required: true,
-  min: 0,
-},
-
-    invoiceNumber: {
-  type: String,
-  required: true,
-  unique: true,
-  index: true
-},
-
-pickupAgent: {
-  type: mongoose.Schema.Types.ObjectId,
-  ref: 'User',
-},
-
-deliveryAgent: {
-  type: mongoose.Schema.Types.ObjectId,
-  ref: 'User',
-},
-
-  
-
-    pickupAddress: {
-      addressLine: { type: String, required: true, trim: true },
-      city: { type: String, required: true, trim: true },
-    },
-
-    pickupTimeSlot: {
-      type: String,
-      required: true,
-    },
-
-    receiver: {
-      fullName: { type: String, required: true, trim: true },
-      phoneNumber: {
-        type: String,
-        required: true,
-        match: [/^\d{10,12}$/, 'Phone number must be 10 to 12 digits'],
-        trim: true,
-      },
-      addressLine: { type: String, required: true, trim: true },
-      city: { type: String, required: true, trim: true },
-      email: {
-        type: String,
-        trim: true,
-        lowercase: true,
-        match: [/.+\@.+\..+/, 'Please enter a valid email'],
-      },
-      nic: { type: String, trim: true },
-      company: { type: String, trim: true },
-    },
-
-    packageDetails: {
-      type: {
-        type: String, // e.g. Document, Fragile
-        required: true,
-        trim: true,
-      },
-      weight: {
-        type: Number,
-        required: true,
-        min: [0.1, 'Weight must be positive'],
-      },
-      dimensions: {
-        length: { type: Number, default: 0 },
-        width: { type: Number, default: 0 },
-        height: { type: Number, default: 0 },
-      },
-      description: { type: String, trim: true },
-      specialInstructions: { type: String, trim: true },
-    },
-
-    pickupConfirmedAt: { type: Date },
-    deliveredAt: { type: Date },
-    deliveryUpdatedAt: { type: Date },
-
-    payment: {
-      payer: {
-        type: String,
-        enum: ['sender', 'receiver'],
-        required: true,
-      },
-      timing: {
-        type: String,
-        enum: ['pay-in-advance', 'pay-on-delivery'],
-        required: true,
-      },
-      method: {
-        type: String,
-        enum: ['cash', 'online'],
-        required: true,
-      },
-      status: {
-        type: String,
-        enum: ['pending', 'paid', 'collected'],
-        default: 'pending',
-      },
-      notifiedCustomer: {
-  type: Boolean,
-  default: false,
-},
-
-   beforePhoto: { type: String },
-afterPhoto: { type: String },
-receipt: { type: String },
-
-
-    },
-
-   status: {
-  type: String,
-  enum: [
-    'pending',            // Created by user
-    'assigned',           // Pickup agent assigned
-    'picked_up',          // Agent picked up the package
-    'at_hub',             // Arrived at central hub
-    'out_for_delivery',   // Delivery agent assigned
-    'delivered',          // Successfully delivered
-    'delivery_failed',    // Attempt failed
-    'returned',           // Returned to sender
-    'cancelled'           // Cancelled by user/admin
-  ],
-  default: 'pending',
-},
-
-
-    trackingId: {
-      type: String,
-      unique: true,
-      required: true,
-      minlength: 8,
-      maxlength: 20,
-      trim: true,
-    },
+    name: { type: String, trim: true },
+    phone: { type: String, trim: true },
+    province: { type: String, trim: true },
+    district: { type: String, trim: true },
+    street: { type: String, trim: true },
+    details: { type: String, trim: true },
   },
-  { timestamps: true }
+  { _id: false }
 );
 
-// Indexes for faster lookups
-shipmentSchema.index({ status: 1 });
-shipmentSchema.index({ agent: 1 });
-shipmentSchema.index({ createdAt: -1 });
+/**
+ * Item line
+ */
+const itemSchema = new Schema(
+  {
+    description: { type: String, trim: true },
+    quantity: { type: Number, min: 1, default: 1 },
+    weightKg: { type: Number, min: 0 },
+    value: money,
+  },
+  { _id: false }
+);
+
+/**
+ * Geo coordinates
+ */
+const geoSchema = new Schema(
+  {
+    latitude: { type: Number },
+    longitude: { type: Number },
+  },
+  { _id: false }
+);
+
+/**
+ * File reference (for uploads like beforePhoto, afterPhoto, receipt)
+ * Added to support uploadShipmentFiles without breaking existing data.
+ */
+const fileRefSchema = new Schema(
+  {
+    field: { type: String, trim: true },       // e.g., 'beforePhoto'
+    originalName: { type: String, trim: true },
+    fileName: { type: String, trim: true },
+    mimeType: { type: String, trim: true },
+    size: { type: Number, min: 0 },
+    path: { type: String, trim: true },
+    uploadedAt: { type: Date },
+    uploadedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+  },
+  { _id: false }
+);
+
+/**
+ * Cancellation info (soft cancel)
+ */
+const cancellationSchema = new Schema(
+  {
+    reason: { type: String, trim: true, default: 'Cancelled by request' },
+    at: { type: Date },
+    by: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+  },
+  { _id: false }
+);
+
+const shipmentSchema = new Schema(
+  {
+    // Parties
+    sender: {
+      type: Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+      index: true,
+    },
+
+    // Legacy single agent field kept for compatibility
+    agent: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+
+    // Optional dedicated pickup/delivery agents
+    pickupAgent: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+    deliveryAgent: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+
+    // Identifiers
+    invoiceNumber: { type: String, required: true, unique: true, index: true, trim: true },
+    trackingId: {
+      type: String,
+      required: true,
+      unique: true,
+      minlength: 8,
+      maxlength: 40,
+      index: true,
+      // Note: we do NOT force uppercase here to avoid changing legacy docs;
+      // controllers already generate uppercase IDs.
+    },
+
+    // Addresses & content
+    from: { type: addressBlockSchema, required: true },
+    to: { type: addressBlockSchema, required: true },
+    items: { type: [itemSchema], default: [] },
+
+    // Physical attributes
+    weightKg: { type: Number, min: 0 },
+    dimensionsCm: {
+      length: { type: Number, min: 0 },
+      width: { type: Number, min: 0 },
+      height: { type: Number, min: 0 },
+    },
+
+    // Financials
+    baseCharge: money,
+    serviceCharge: money,
+    fuelSurcharge: money,
+    otherFees: money,
+    codAmount: money, // Cash on Delivery amount
+    isCOD: { type: Boolean, default: false },
+    currency: { type: String, default: 'AFN' },
+
+    // Status (kept flexible to avoid breaking existing flows)
+    status: { type: String, trim: true, default: 'Created', index: true },
+
+    // Timeline
+    pickedUpAt: { type: Date },
+    deliveredAt: { type: Date },
+
+    // Location + logs
+    lastLocation: {
+      province: { type: String, trim: true },
+      district: { type: String, trim: true },
+      geo: { type: geoSchema, default: undefined },
+    },
+
+    notes: { type: String, trim: true },
+
+    // Tracking logs
+    logs: [{ type: Schema.Types.ObjectId, ref: 'TrackingLog' }],
+
+    /**
+     * NEW: Soft-cancel info (used by cancelShipment controller)
+     * If not cancelled, this remains undefined.
+     */
+    cancellation: { type: cancellationSchema, default: undefined },
+
+    /**
+     * NEW: Optional attachments container for uploads
+     * Your controller writes into whichever container exists;
+     * we add 'attachments' so nothing breaks if none existed.
+     */
+    attachments: {
+      beforePhoto: { type: fileRefSchema, default: undefined },
+      afterPhoto:  { type: fileRefSchema, default: undefined },
+      receipt:     { type: fileRefSchema, default: undefined },
+    },
+  },
+  {
+    timestamps: true,
+    versionKey: false,
+  }
+);
+
+/**
+ * Indexes for common access patterns
+ */
+shipmentSchema.index({ status: 1, createdAt: -1 });
+shipmentSchema.index({ pickupAgent: 1, createdAt: -1 });
+shipmentSchema.index({ deliveryAgent: 1, createdAt: -1 });
+shipmentSchema.index({ 'from.province': 1, 'to.province': 1 });
+
+// Keep JSON clean
+shipmentSchema.set('toJSON', {
+  versionKey: false,
+  transform(_doc, ret) {
+    return ret;
+  },
+});
 
 const Shipment = mongoose.model('Shipment', shipmentSchema);
 export default Shipment;

@@ -1,68 +1,100 @@
+// backend/models/User.js
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 
-const addressSchema = new mongoose.Schema({
-  province: { type: String, trim: true },
-  district: { type: String, trim: true },
-  street: { type: String, trim: true },
-  details: { type: String, trim: true },
-  isDefault: { type: Boolean, default: false },
-});
+/**
+ * Address subdocument (no _id to keep docs compact)
+ */
+const addressSchema = new mongoose.Schema(
+  {
+    province: { type: String, trim: true },
+    district: { type: String, trim: true },
+    street: { type: String, trim: true },
+    details: { type: String, trim: true },
+    isDefault: { type: Boolean, default: false },
+  },
+  { _id: false }
+);
+
+/**
+ * Optional agent profile (only for role === 'agent')
+ */
+const agentProfileSchema = new mongoose.Schema(
+  {
+    code: { type: String, trim: true, index: true }, // human-friendly agent code
+    branch: { type: String, trim: true },
+    assignedProvinces: [{ type: String, trim: true }],
+    isActive: { type: Boolean, default: true },
+  },
+  { _id: false }
+);
 
 const userSchema = new mongoose.Schema(
   {
-    fullName: {
+    fullName: { type: String, required: true, trim: true },
+
+    email: { type: String, trim: true, lowercase: true, index: true },
+    phone: {
       type: String,
       required: true,
       trim: true,
-      minlength: 2,
+      // Block empty strings so they don't get indexed as unique
+      validate: {
+        validator: (v) => typeof v === 'string' && v.trim().length > 0,
+        message: 'Phone cannot be empty',
+      },
     },
-    phoneNumber: {
-      type: String,
-      required: true,
-      unique: true,
-      trim: true,
-      match: [/^\d{10,12}$/, 'Phone number must be 10 to 12 digits'],
-    },
-    email: {
-      type: String,
-      trim: true,
-      lowercase: true,
-      match: [/.+\@.+\..+/, 'Please enter a valid email'],
-    },
-    password: {
-      type: String,
-      required: true,
-      minlength: 6,
-    },
+
+    // Hidden by default; login explicitly selects it
+    password: { type: String, required: true, minlength: 6, select: false },
+
     role: {
       type: String,
-      enum: ['user', 'admin', 'agent'],
-      default: 'user',
+      enum: ['admin', 'agent', 'customer'],
+      default: 'customer',
+      index: true,
     },
-    emailVerified: {
-  type: Boolean,
-  default: false,
-},
-phoneVerified: {
-  type: Boolean,
-  default: false,
-},
-    addresses: [addressSchema],
-  },
-  { timestamps: true },
-  
-  {
-    emailVerificationToken: String,
-emailVerificationExpire: Date,
-    resetPasswordToken: String,
-    resetPasswordExpire: Date,
-    profilePicture: { type: String },
 
+    addresses: { type: [addressSchema], default: [] },
+
+    // Only present for agents
+    agentProfile: { type: agentProfileSchema, default: undefined },
+
+    isBlocked: { type: Boolean, default: false },
+    lastLoginAt: { type: Date },
+    profilePicture: { type: String, trim: true },
+  },
+  {
+    timestamps: true,
+    versionKey: false,
+    toJSON: {
+      transform(_doc, ret) {
+        delete ret.password;
+        return ret;
+      },
+    },
   }
 );
 
-// ✅ Hash password before saving
+/**
+ * Indexes
+ *  - Partial unique on phone => enforces uniqueness only for non-empty strings
+ *    (Allowed operators for partial filters: $exists, $eq, $gt/$gte/$lt/$lte, $type, $and/$or)
+ */
+userSchema.index(
+  { phone: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { phone: { $exists: true, $type: 'string', $gt: '' } },
+  }
+);
+
+// Helpful compound index
+userSchema.index({ role: 1, phone: 1 });
+
+/**
+ * Password hash (only if changed)
+ */
 userSchema.pre('save', async function (next) {
   if (!this.isModified('password')) return next();
   const salt = await bcrypt.genSalt(10);
@@ -70,28 +102,12 @@ userSchema.pre('save', async function (next) {
   next();
 });
 
-// ✅ Add method to check password
-userSchema.methods.matchPassword = async function (enteredPassword) {
-  return await bcrypt.compare(enteredPassword, this.password);
+/**
+ * Compare password helper
+ */
+userSchema.methods.matchPassword = async function (entered) {
+  return bcrypt.compare(entered, this.password);
 };
 
-
-// reset password schema.methods:
-userSchema.methods.generatePasswordResetToken = function () {
-  const resetToken = crypto.randomBytes(20).toString('hex');
-
-  this.resetPasswordToken = crypto
-    .createHash('sha256')
-    .update(resetToken)
-    .digest('hex');
-
-  this.resetPasswordExpire = Date.now() + 15 * 60 * 1000; // 15 minutes
-
-  return resetToken;
-};
-
-
-
-// ✅ Create model
 const User = mongoose.model('User', userSchema);
 export default User;

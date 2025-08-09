@@ -1,35 +1,66 @@
+// backend/middleware/uploadMiddleware.js
 import multer from 'multer';
 import path from 'path';
+import fs from 'fs';
+import crypto from 'crypto';
 
-// Storage config
-const storage = multer.diskStorage({
-  destination(req, file, cb) {
-    cb(null, 'uploads/'); // Save to /uploads folder
-  },
-  filename(req, file, cb) {
-    cb(
-      null,
-      `${file.fieldname}-${Date.now()}${path.extname(file.originalname)}`
-    );
-  },
-});
+const UPLOAD_DIR = path.resolve(process.cwd(), 'backend', 'uploads');
 
-// File type check
-function checkFileType(file, cb) {
-  const filetypes = /jpg|jpeg|png|pdf/;
-  const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
-  const mimetype = filetypes.test(file.mimetype);
-  if (extname && mimetype) {
-    return cb(null, true);
-  } else {
-    cb('Only JPG, PNG, or PDF files allowed');
-  }
+// Ensure uploads directory exists
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
+// Safe, collision-resistant filenames
+function safeFileName(originalName) {
+  const ext = path.extname(originalName || '').toLowerCase();
+  const base = path
+    .basename(originalName || 'file', ext)
+    .replace(/[^a-z0-9_\-]+/gi, '_')
+    .slice(0, 50); // keep it readable, capped
+  const rand = crypto.randomBytes(6).toString('hex'); // 12 chars
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return `${base}_${stamp}_${rand}${ext}`;
+}
+
+// Disk storage (local). If you switch to S3 later, replace this block.
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+  filename: (_req, file, cb) => cb(null, safeFileName(file.originalname)),
+});
+
+// Allowed mimetypes per field
+const ALLOWED = {
+  beforePhoto: new Set(['image/jpeg', 'image/png', 'image/webp']),
+  afterPhoto: new Set(['image/jpeg', 'image/png', 'image/webp']),
+  receipt: new Set(['image/jpeg', 'image/png', 'application/pdf']),
+};
+
+// Validate each file by field + mimetype
+function fileFilter(req, file, cb) {
+  const allowed = ALLOWED[file.fieldname];
+  if (!allowed) {
+    const err = new multer.MulterError('LIMIT_UNEXPECTED_FILE', file.fieldname);
+    err.message = `Unexpected field: ${file.fieldname}`;
+    return cb(err);
+  }
+  if (!allowed.has(file.mimetype)) {
+    const err = new multer.MulterError('LIMIT_UNEXPECTED_FILE', file.fieldname);
+    err.message =
+      `Invalid file type for "${file.fieldname}". ` +
+      `Allowed: ${[...allowed].join(', ')}`;
+    return cb(err);
+  }
+  cb(null, true);
+}
+
+// Global limits
 const upload = multer({
   storage,
-  fileFilter: function (req, file, cb) {
-    checkFileType(file, cb);
+  fileFilter,
+  limits: {
+    files: 3,                  // we expect up to 3 fields
+    fileSize: 10 * 1024 * 1024 // 10 MB per file (raise/lower as needed)
   },
 });
 

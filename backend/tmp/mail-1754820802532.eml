@@ -1,0 +1,79 @@
+From: Rahman Express Post <rahmanpostdev@gmail.com>
+To: test4@example.com
+Subject: Verify your email
+Message-ID: <3bcdbb74-9a38-5dbc-cb76-f3cb4d09fe50@gmail.com>
+Date: Sun, 10 Aug 2025 10:13:22 +0000
+MIME-Version: 1.0
+Content-Type: multipart/alternative;
+ boundary="--_NmP-3821eca1ec884a17-Part_1"
+
+----_NmP-3821eca1ec884a17-Part_1
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+Please verify your email: http://localhost:5000/api/auth/verify-email?=
+token=3Dfb5539e53359179178eb85d2ffa2c658f4587faf78733e2991021330cb4ce320
+----_NmP-3821eca1ec884a17-Part_1
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+<!doctype html>
+<html lang=3D"en">
+  <head><meta charset=3D"utf-8"><meta =
+name=3D"color-scheme" content=3D"light only">
+    <meta name=3D"viewport" =
+content=3D"width=3Ddevice-width, initial-scale=3D1" />
+    <title>Verify your email</title>
+  </head>
+  <body =
+style=3D"margin:0;padding:0;background:#f6f8fb;font-family:-apple-system,=
+BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#111;">
+    <table role=3D"presentation" width=3D"100%" cellspacing=3D"0" =
+cellpadding=3D"0" style=3D"background:#f6f8fb;padding:24px 0;">
+      <tr>
+        <td align=3D"center">
+          <table role=3D"presentation" =
+width=3D"600" cellspacing=3D"0" cellpadding=3D"0" style=3D"max-width:600px;=
+width:100%;background:#ffffff;border-radius:16px;box-shadow:0 2px 12px =
+rgba(0,0,0,0.05);overflow:hidden">
+            <tr>
+              <td style=3D"padding:24px 24px 0 24px;">
+                <h1 style=3D"margin:0 0 8px 0;font-size:20px;font-weight:70=
+0;">Verify your email</h1>
+              </td>
+            </tr>
+            <tr>
+              <td style=3D"padding:8px 24px 24px =
+24px;line-height:1.6;font-size:15px;">
+               =20
+        <p>Thanks for signing up with Rahman Express Post.</p>
+        <p>Please confirm your email address by clicking the button =
+below:</p>
+        <p style=3D"margin:16px 0">
+          <a =
+href=3D"http://localhost:5000/api/auth/verify-email?=
+token=3Dfb5539e53359179178eb85d2ffa2c658f4587faf78733e2991021330cb4ce320" =
+style=3D"display:inline-block;padding:12px 18px;border-radius:10px;text-dec=
+oration:none;background:#111;color:#fff;font-weight:600">
+            Verify Email
+          </a>
+        </p>
+        <p>Or paste this link into your browser:<br><span =
+style=3D"word-break:break-all">http://localhost:5000/api/auth/verify-email?=
+token=3Dfb5539e53359179178eb85d2ffa2c658f4587faf78733e2991021330cb4ce320</s=
+pan></p>
+     =20
+                <p style=3D"margin-top:24px;color:#6b7280=
+;font-size:12px">If you weren=E2=80=99t expecting this email, you can =
+safely ignore it.</p>
+              </td>
+            </tr>
+          </table>
+          <div style=3D"padding:12px;color:#9ca3af;font-=
+size:12px">=C2=A9 2025 Rahman Express Post</div>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
+----_NmP-3821eca1ec884a17-Part_1--

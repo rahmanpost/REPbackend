@@ -1,296 +1,321 @@
 // backend/controllers/authController.js
-import asyncHandler from 'express-async-handler';
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
-
+import jwt from 'jsonwebtoken';
+import asyncHandler from 'express-async-handler';
 import User from '../models/User.js';
-import LoginAttempt from '../models/LoginAttempt.js';
-import VerificationToken from '../models/VerificationToken.js';
-import PasswordResetToken from '../models/PasswordResetToken.js';
+import { sendVerificationEmail, sendPasswordResetEmail } from '../utils/mailer.js';
 
-/** Helpers */
-const signToken = (user) =>
-  jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRE || '7d',
-  });
 
-/** Lockout/backoff settings (beyond rate limiter) */
-const MAX_ATTEMPTS = 5;            // attempts before temporary lock
-const LOCK_MS      = 15 * 60_000;  // 15 minutes
-const BACKOFF_MS   = [0, 5_000, 10_000, 20_000, 30_000]; // progressive waits (ms)
-
-/** Normalize role checks */
-const isElevated = (role) => ['ADMIN', 'AGENT'].includes(String(role || '').toUpperCase());
-
-/** Load or create attempt record by email-ish key */
-async function getAttempt(key) {
-  let rec = await LoginAttempt.findOne({ key });
-  if (!rec) rec = await LoginAttempt.create({ key, count: 0, lastAttempt: new Date(0) });
-  return rec;
+// in authController.js (top)
+async function safeEmail(promise, label='email'){
+  try { return await promise; } 
+  catch(e){ console.error(`[mailer] ${label} failed:`, e?.response || e?.message || e); return null; }
 }
 
-/** Compute remaining lock/backoff time (ms). Returns { waitMs, locked } */
-function computeWait(attempt) {
-  const now = Date.now();
-  // Lock window
-  if (attempt.lockUntil && attempt.lockUntil.getTime() > now) {
-    return { waitMs: attempt.lockUntil.getTime() - now, locked: true };
-  }
-  // Soft backoff based on recent count
-  const idx = Math.min(attempt.count, BACKOFF_MS.length - 1);
-  const waitMs = BACKOFF_MS[idx] || 0;
-  const since = now - (attempt.lastAttempt?.getTime() || 0);
-  return { waitMs: Math.max(0, waitMs - since), locked: false };
+/** ------------------------
+ * Config & tiny utilities
+ * ---------------------- */
+const {
+  JWT_SECRET,
+  JWT_EXPIRE = '7d',
+  EMAIL_VERIFICATION_REQUIRED = 'true', // set to 'false' to skip email verify gating on login
+} = process.env;
+
+function signToken(user) {
+  return jwt.sign({ id: user._id, role: user.role }, JWT_SECRET, { expiresIn: JWT_EXPIRE });
 }
 
-/** Record a failed login and maybe set lockUntil */
-async function recordFail(attempt) {
-  attempt.count = (attempt.count || 0) + 1;
-  attempt.lastAttempt = new Date();
-  if (attempt.count >= MAX_ATTEMPTS) {
-    attempt.lockUntil = new Date(Date.now() + LOCK_MS);
-    attempt.count = 0; // reset after starting a lock window
-  }
-  await attempt.save();
+function buildAbsoluteUrl(req, relativePathWithQuery) {
+  const proto = (req.get('x-forwarded-proto') || req.protocol || 'http').split(',')[0].trim();
+  const host = (req.get('x-forwarded-host') || req.get('host')).split(',')[0].trim();
+  return `${proto}://${host}${relativePathWithQuery}`;
 }
 
-/** Reset attempt state on success */
-async function recordSuccess(attempt) {
-  attempt.count = 0;
-  attempt.lockUntil = undefined;
-  attempt.lastAttempt = new Date();
-  await attempt.save();
+// Progressive backoff config
+const MAX_ATTEMPTS = 5;
+const BASE_LOCK_MINUTES = 15;
+
+/** Compute next lockout based on attempts */
+function computeLockUntil(attempts) {
+  // Exponential backoff: 15m, 30m, 60m, cap at 24h
+  const minutes = Math.min(BASE_LOCK_MINUTES * Math.pow(2, Math.max(0, attempts - MAX_ATTEMPTS)), 24 * 60);
+  return new Date(Date.now() + minutes * 60 * 1000);
 }
 
-/** Generate base64url token */
-function randomToken(bytes = 32) {
-  return crypto.randomBytes(bytes).toString('base64url');
+function isLocked(user) {
+  return user.lockUntil && user.lockUntil > new Date();
 }
 
-/** (Optional) issue email verification token */
-async function issueVerificationToken(userId, ttlMinutes = 60 * 24) {
-  const token = randomToken(32);
-  const expiresAt = new Date(Date.now() + ttlMinutes * 60_000);
-  await VerificationToken.create({ user: userId, token, expiresAt });
-  return token;
+/** Hash a token for DB storage */
+function hashToken(raw) {
+  return crypto.createHash('sha256').update(raw).digest('hex');
 }
 
-/** POST /api/auth/register */
+/** Generate a random token (returned raw), and hashed version + expiry for DB */
+function genTokenPair(expMinutes = 60) {
+  const raw = crypto.randomBytes(32).toString('hex');
+  const hashed = hashToken(raw);
+  const expires = new Date(Date.now() + expMinutes * 60 * 1000);
+  return { raw, hashed, expires };
+}
+
+/** ------------------------
+ * Auth Controllers
+ * ---------------------- */
+
+/**
+ * @route  POST /api/auth/register
+ * @access Public
+ */
 export const register = asyncHandler(async (req, res) => {
-  const { name, email, password, role } = req.body || {};
-
-  if (!name || !email || !password) {
-    return res.status(400).json({ success: false, message: 'name, email, and password are required.' });
+  const { fullName, name, phone, email, password } = req.body || {};
+  // Zod already validated, but double-check
+  if ((!fullName && !name) || !phone || !email || !password) {
+    return res.status(400).json({ success: false, message: 'fullName/name, phone, email, and password are required' });
   }
 
-  const existing = await User.findOne({ email: String(email).toLowerCase().trim() });
+  const existing = await User.findOne({ email: email.toLowerCase() });
   if (existing) {
-    return res.status(409).json({ success: false, message: 'Email is already registered.' });
+    return res.status(409).json({ success: false, message: 'Email already registered' });
   }
-
-  const salt = await bcrypt.genSalt(10);
-  const hashed = await bcrypt.hash(password, salt);
 
   const user = await User.create({
-    name: String(name).trim(),
-    email: String(email).toLowerCase().trim(),
-    password: hashed,
-    role: role && isElevated(role) ? role : 'USER',
+    fullName: fullName || name,      // ← map name → fullName
+    phone,                            // ← required by your model
+    email: email.toLowerCase(),
+    password,                         // assume pre-save hook hashes
+    emailVerified: false,
+    loginAttempts: 0,
+    lockUntil: null,
   });
 
-  // Optional: email verification hook (enable when you wire emailing)
-  let verification = null;
-  if (process.env.ENABLE_EMAIL_VERIFICATION === 'true') {
-    const token = await issueVerificationToken(user._id);
-    verification = {
-      token,
-      // Example link (adjust domain/route as you like)
-      link: `${process.env.PUBLIC_APP_ORIGIN || 'http://localhost:3000'}/verify?token=${token}`,
-    };
-    // TODO: send email via your mailer here
+  if (EMAIL_VERIFICATION_REQUIRED === 'true') {
+    const { raw, hashed, expires } = genTokenPair(60 * 24); // 24h
+    user.emailVerifyToken = hashed;
+    user.emailVerifyExpires = expires;
+    await user.save({ validateBeforeSave: false });
+
+    const verifyUrl = buildAbsoluteUrl(req, `/api/auth/verify-email?token=${encodeURIComponent(raw)}`);
+    await safeEmail(sendVerificationEmail({ to: user.email, verifyUrl }), 'verification');
+
   }
 
-  const jwtToken = signToken(user);
+  const token = signToken(user);
   return res.status(201).json({
     success: true,
+    message: 'Registered successfully',
     data: {
-      user: { id: user._id, name: user.name, email: user.email, role: user.role },
-      token: jwtToken,
-      verification, // null unless enabled
+      token,
+      user: {
+        id: user._id,
+        email: user.email,
+        fullName: user.fullName,
+        phone: user.phone,
+        role: user.role,
+        emailVerified: user.emailVerified,
+      },
     },
   });
 });
 
-/** POST /api/auth/login */
+
+/**
+ * @route  POST /api/auth/login
+ * @access Public
+ */
 export const login = asyncHandler(async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
-    return res.status(400).json({ success: false, message: 'email and password are required.' });
+    return res.status(400).json({ success: false, message: 'Email and password are required' });
   }
 
-  const emailKey = String(email).toLowerCase().trim();
-  const attempt = await getAttempt(emailKey);
-
-  // Enforce lock/backoff
-  const { waitMs, locked } = computeWait(attempt);
-  if (locked || waitMs > 0) {
-    const seconds = Math.ceil(waitMs / 1000);
-    return res.status(429).json({
-      success: false,
-      message: locked
-        ? `Too many attempts. Try again in ${seconds}s.`
-        : `Please wait ${seconds}s before trying again.`,
-    });
-  }
-
-  const user = await User.findOne({ email: emailKey });
+  const user = await User.findOne({ email: email.toLowerCase() }).select('+password +loginAttempts +lockUntil');
   if (!user) {
-    await recordFail(attempt);
-    return res.status(401).json({ success: false, message: 'Invalid email or password.' });
+    return res.status(401).json({ success: false, message: 'Invalid credentials' });
   }
 
-  const match = await bcrypt.compare(password, user.password);
-  if (!match) {
-    await recordFail(attempt);
-    return res.status(401).json({ success: false, message: 'Invalid email or password.' });
+  if (isLocked(user)) {
+    return res.status(423).json({ success: false, message: 'Account temporarily locked. Try again later.' });
   }
 
-  // (Optional) gate by verification
-  if (process.env.ENABLE_EMAIL_VERIFICATION === 'true') {
-    const unverified = await VerificationToken.findOne({
-      user: user._id,
-      consumedAt: { $exists: false },
-      expiresAt: { $gt: new Date() },
-    });
-    if (unverified) {
-      return res.status(403).json({
-        success: false,
-        message: 'Email not verified. Please check your inbox.',
-      });
+  const isMatch = await user.matchPassword(password);
+  if (!isMatch) {
+    user.loginAttempts = (user.loginAttempts || 0) + 1;
+
+    if (user.loginAttempts >= MAX_ATTEMPTS) {
+      user.lockUntil = computeLockUntil(user.loginAttempts);
+      user.loginAttempts = 0; // reset counter after locking
     }
+
+    await user.save({ validateBeforeSave: false });
+    return res.status(401).json({ success: false, message: 'Invalid credentials' });
   }
 
-  await recordSuccess(attempt);
+  // Success: reset attempts & lock
+  user.loginAttempts = 0;
+  user.lockUntil = null;
 
+  // Require verified email if configured
+  if (EMAIL_VERIFICATION_REQUIRED === 'true' && !user.emailVerified) {
+    // Keep the UX smooth: if no token or expired, refresh a new one automatically
+    const needNew = !user.emailVerifyToken || !user.emailVerifyExpires || user.emailVerifyExpires < new Date();
+    if (needNew) {
+      const { raw, hashed, expires } = genTokenPair(60 * 24);
+      user.emailVerifyToken = hashed;
+      user.emailVerifyExpires = expires;
+      const verifyUrl = buildAbsoluteUrl(req, `/api/auth/verify-email?token=${encodeURIComponent(raw)}`);
+      await sendVerificationEmail({ to: user.email, verifyUrl });
+    }
+    await user.save({ validateBeforeSave: false });
+    return res.status(403).json({ success: false, message: 'Email not verified. Verification link sent to your email.' });
+  }
+
+  await user.save({ validateBeforeSave: false });
   const token = signToken(user);
   res.json({
     success: true,
+    message: 'Logged in',
     data: {
-      user: { id: user._id, name: user.name, email: user.email, role: user.role },
       token,
+      user: {
+        id: user._id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        emailVerified: user.emailVerified,
+      },
     },
   });
 });
 
-/** POST /api/auth/verify-email  (optional) */
-export const verifyEmail = asyncHandler(async (req, res) => {
-  if (process.env.ENABLE_EMAIL_VERIFICATION !== 'true') {
-    return res.status(404).json({ success: false, message: 'Email verification is disabled.' });
+/**
+ * @route  POST /api/auth/forgot-password
+ * @access Public
+ */
+export const forgotPassword = asyncHandler(async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ success: false, message: 'Email is required' });
+
+  const user = await User.findOne({ email: email.toLowerCase() });
+  if (!user) {
+    // Do not reveal whether an account exists
+    return res.json({ success: true, message: 'If that email exists, a reset link has been sent.' });
   }
 
-  const { token } = req.body || {};
-  if (!token) return res.status(400).json({ success: false, message: 'token is required.' });
+  const { raw, hashed, expires } = genTokenPair(60); // 60 minutes
+  user.resetPasswordToken = hashed;
+  user.resetPasswordExpires = expires;
+  await user.save({ validateBeforeSave: false });
 
-  const rec = await VerificationToken.findOne({ token });
-  if (!rec || rec.expiresAt < new Date() || rec.consumedAt) {
-    return res.status(400).json({ success: false, message: 'Invalid or expired token.' });
-  }
+  const resetUrl = buildAbsoluteUrl(req, `/api/auth/reset-password?token=${encodeURIComponent(raw)}`);
+  await sendPasswordResetEmail({ to: user.email, resetUrl });
 
-  rec.consumedAt = new Date();
-  await rec.save();
-
-  // Optionally mark user verified if your schema has such a flag
-  // await User.findByIdAndUpdate(rec.user, { emailVerified: true });
-
-  res.json({ success: true, message: 'Email verified.' });
+  res.json({ success: true, message: 'If that email exists, a reset link has been sent.' });
 });
 
-/** GET /api/auth/me */
-export const me = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.user._id).select('_id name email role');
+/**
+ * @route  POST /api/auth/reset-password
+ * @access Public
+ * @body   { token, password }
+ */
+export const resetPassword = asyncHandler(async (req, res) => {
+  const { token, password } = req.body || {};
+  if (!token || !password) {
+    return res.status(400).json({ success: false, message: 'Token and new password are required' });
+  }
+
+  const hashed = hashToken(token);
+  const user = await User.findOne({
+    resetPasswordToken: hashed,
+    resetPasswordExpires: { $gt: new Date() },
+  }).select('+password');
+
+  if (!user) {
+    return res.status(400).json({ success: false, message: 'Reset token is invalid or has expired' });
+  }
+
+  user.password = password; // assume pre-save hook hashes
+  user.resetPasswordToken = undefined;
+  user.resetPasswordExpires = undefined;
+
+  // Also clear login lock if any
+  user.loginAttempts = 0;
+  user.lockUntil = null;
+
+  await user.save();
+  res.json({ success: true, message: 'Password has been reset successfully' });
+});
+
+/**
+ * @route  GET /api/auth/verify-email
+ * @access Public
+ * @query  token
+ */
+export const verifyEmail = asyncHandler(async (req, res) => {
+  const { token } = req.query || {};
+  if (!token) return res.status(400).json({ success: false, message: 'Token is required' });
+
+  const hashed = hashToken(token);
+  const user = await User.findOne({
+    emailVerifyToken: hashed,
+    emailVerifyExpires: { $gt: new Date() },
+  });
+
+  if (!user) {
+    return res.status(400).json({ success: false, message: 'Verification token is invalid or has expired' });
+  }
+
+  user.emailVerified = true;
+  user.emailVerifyToken = undefined;
+  user.emailVerifyExpires = undefined;
+  await user.save({ validateBeforeSave: false });
+
+  res.json({ success: true, message: 'Email verified successfully' });
+});
+
+/**
+ * @route  POST /api/auth/resend-verification
+ * @access Private (or Public if you prefer)
+ */
+export const resendVerification = asyncHandler(async (req, res) => {
+  const email = (req.body?.email || req.user?.email || '').toLowerCase();
+  if (!email) return res.status(400).json({ success: false, message: 'Email is required' });
+
+  const user = await User.findOne({ email });
+  if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+  if (user.emailVerified) {
+    return res.json({ success: true, message: 'Email already verified' });
+  }
+
+  const { raw, hashed, expires } = genTokenPair(60 * 24);
+  user.emailVerifyToken = hashed;
+  user.emailVerifyExpires = expires;
+  await user.save({ validateBeforeSave: false });
+
+  const verifyUrl = buildAbsoluteUrl(req, `/api/auth/verify-email?token=${encodeURIComponent(raw)}`);
+  await sendVerificationEmail({ to: user.email, verifyUrl });
+
+  res.json({ success: true, message: 'Verification link sent' });
+});
+
+/**
+ * @route  GET /api/auth/me
+ * @access Private
+ */
+export const getMe = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.user.id).select('-password');
   res.json({ success: true, data: user });
 });
 
-// --- Password reset flow ---
-
-/** POST /api/auth/forgot-password
- * Always returns 200 (to avoid email enumeration).
- * If the user exists, creates a 1-hour reset token and (optionally) sends email.
+/**
+ * @route  POST /api/auth/logout
+ * @access Private
+ * (JWT logout is typically client-side; this is just a stub)
  */
-export const forgotPassword = async (req, res) => {
-  try {
-    const { email } = req.body || {};
-    const emailKey = String(email || '').toLowerCase().trim();
-    if (!emailKey) {
-      return res.status(400).json({ success: false, message: 'email is required.' });
-    }
+export const logout = asyncHandler(async (_req, res) => {
+  res.json({ success: true, message: 'Logged out' });
+});
 
-    const user = await User.findOne({ email: emailKey }).select('_id email');
-    // Always act like it worked (don’t leak if email exists or not)
-    if (!user) {
-      return res.json({ success: true, message: 'If the email is registered, a reset link will be sent.' });
-    }
-
-    // Create a fresh token (invalidate any previous tokens for this user)
-    await PasswordResetToken.deleteMany({ user: user._id });
-    const token = crypto.randomBytes(32).toString('base64url');
-    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
-
-    await PasswordResetToken.create({ user: user._id, token, expiresAt });
-
-    const appOrigin = process.env.PUBLIC_APP_ORIGIN || 'http://localhost:3000';
-    const link = `${appOrigin}/reset-password?token=${token}`;
-
-    // TODO: send email with your mailer here
-    // await sendPasswordResetEmail(user.email, link);
-
-    // In dev, you may want to reveal the link; in prod you wouldn’t.
-    const revealLink = process.env.NODE_ENV !== 'production';
-
-    return res.json({
-      success: true,
-      message: 'If the email is registered, a reset link will be sent.',
-      ...(revealLink ? { debug: { link } } : {}),
-    });
-  } catch (err) {
-    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
-  }
-};
-
-/** POST /api/auth/reset-password
- * Body: { token, newPassword }
- */
-export const resetPassword = async (req, res) => {
-  try {
-    const { token, newPassword } = req.body || {};
-    if (!token || !newPassword) {
-      return res.status(400).json({ success: false, message: 'token and newPassword are required.' });
-    }
-    const rec = await PasswordResetToken.findOne({ token });
-    if (!rec || rec.expiresAt < new Date() || rec.consumedAt) {
-      return res.status(400).json({ success: false, message: 'Invalid or expired token.' });
-    }
-
-    const user = await User.findById(rec.user).select('_id password');
-    if (!user) {
-      return res.status(400).json({ success: false, message: 'Invalid token.' });
-    }
-
-    const salt = await bcrypt.genSalt(10);
-    const hashed = await bcrypt.hash(String(newPassword), salt);
-    user.password = hashed;
-    await user.save();
-
-    rec.consumedAt = new Date();
-    await rec.save();
-
-    return res.json({ success: true, message: 'Password has been reset. You can now log in.' });
-  } catch (err) {
-    return res.status(500).json({ success: false, message: 'Server error', error: err.message });
-  }
-};
-
-// --- Back-compat aliases for existing routes ---
-export { login as loginUser };
-export { register as registerUser };
+/** Back-compat aliases (keep existing routes working) */
+export const registerUser = register;
+export const loginUser = login;

@@ -1,18 +1,37 @@
-import Shipment from '../models/shipment.js';
+// backend/utils/generateInvoiceNumber.js
+import crypto from 'crypto';
 
-export const generateInvoiceNumber = async () => {
-  const date = new Date();
-  const prefix = `INV-${date.getFullYear()}${(date.getMonth() + 1)
-    .toString()
-    .padStart(2, '0')}${date.getDate().toString().padStart(2, '0')}`;
+function yyyymmddKabul(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kabul',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(date); // e.g. "2025-08-10"
+  return parts.replace(/-/g, '');
+}
 
-  const count = await Shipment.countDocuments({
-    createdAt: {
-      $gte: new Date(date.setHours(0, 0, 0, 0)),
-      $lt: new Date(date.setHours(23, 59, 59, 999)),
-    }
-  });
+function randBase36(len = 6) {
+  const max = 36 ** len;
+  const n = crypto.randomInt(0, max);
+  return n.toString(36).toUpperCase().padStart(len, '0');
+}
 
-  const number = (count + 1).toString().padStart(4, '0');
-  return `${prefix}-${number}`; // e.g., INV-20250804-0001
-};
+/**
+ * Generate like: REP-INV-20250810-0F3XQ9
+ * @param {object} opts
+ * @param {(s: string)=>Promise<boolean>} isTaken async unique check
+ */
+export async function generateInvoiceNumber(
+  { prefix = 'REP-INV', date = new Date(), len = 6, maxAttempts = 12 } = {},
+  isTaken
+) {
+  const day = yyyymmddKabul(date);
+  for (let i = 0; i < maxAttempts; i++) {
+    const suffix = randBase36(len);
+    const candidate = `${prefix}-${day}-${suffix}`;
+    if (!isTaken) return candidate;
+    if (!(await isTaken(candidate))) return candidate;
+  }
+  throw new Error('Failed to generate a unique invoice number');
+}

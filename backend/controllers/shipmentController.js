@@ -5,6 +5,7 @@ import Shipment from '../models/shipment.js';
 import Pricing from '../models/pricing.js';
 import { computeTotals } from '../utils/pricing/calc.js';
 import { generateTrackingIdWithRetry } from '../utils/generateTrackingId.js';
+import { generateInvoiceNumber } from '../utils/generateInvoiceNumber.js';
 
 const isObjectId = (v) => mongoose.Types.ObjectId.isValid(v);
 const toInt = (v, def) => {
@@ -43,16 +44,20 @@ export const createShipment = asyncHandler(async (req, res) => {
   if (!senderId || !isObjectId(senderId)) {
     return httpError(res, 400, 'Valid sender is required.');
   }
-  if (!invoiceNumber || typeof invoiceNumber !== 'string') {
-    return httpError(res, 400, 'invoiceNumber is required.');
-  }
-  if (agent && !isObjectId(agent)) {
-    return httpError(res, 400, 'Agent must be a valid ID.');
-  }
 
-  // Pre-check unique invoiceNumber
-  const invoiceExists = await Shipment.exists({ invoiceNumber });
-  if (invoiceExists) return httpError(res, 409, 'invoiceNumber already exists.');
+  // ——— Invoice number: accept provided or generate a unique one ———
+  let finalInvoiceNumber =
+    typeof invoiceNumber === 'string' && invoiceNumber.trim()
+      ? invoiceNumber.trim()
+      : null;
+
+  if (finalInvoiceNumber) {
+    const exists = await Shipment.exists({ invoiceNumber: finalInvoiceNumber });
+    if (exists) return httpError(res, 409, 'invoiceNumber already exists.');
+  } else {
+    const isTaken = async (num) => !!(await Shipment.exists({ invoiceNumber: num }));
+    finalInvoiceNumber = await generateInvoiceNumber({}, isTaken); // eg INV-2025-123456
+  }
 
   // Collision-safe tracking ID
   const trackingId = await generateTrackingIdWithRetry(
@@ -64,7 +69,7 @@ export const createShipment = asyncHandler(async (req, res) => {
   const doc = {
     sender: senderId,
     agent: agent || null,
-    invoiceNumber,
+    invoiceNumber: finalInvoiceNumber,
     trackingId,
     serviceType: serviceType || 'EXPRESS',
     from: from || undefined,
@@ -110,12 +115,14 @@ export const createShipment = asyncHandler(async (req, res) => {
       doc.otherFees = Math.round((otherFixed + codFee) * 100) / 100;
 
       doc.currency = quote.currency || 'AFN';
+      // Store pricing version for audit
+      if (activePricing.version) doc.pricingVersion = activePricing.version;
     }
   } catch (_e) {
     // swallow pricing failure; proceed with creation
   }
 
-  // Merge any extra fields not covered above
+  // Merge any extra fields not covered above (without overriding what we've set)
   for (const [k, v] of Object.entries(req.body || {})) {
     if (!(k in doc)) doc[k] = v;
   }
@@ -413,6 +420,7 @@ export const repriceShipment = asyncHandler(async (req, res) => {
   shipment.fuelSurcharge = quote.breakdown.fuelSurcharge || 0;
   shipment.otherFees = Math.round(((quote.breakdown.otherFixedFees || 0) + (quote.breakdown.codFee || 0)) * 100) / 100;
   shipment.currency = quote.currency || 'AFN';
+  if (pricing.version) shipment.pricingVersion = pricing.version;
 
   await shipment.save();
 

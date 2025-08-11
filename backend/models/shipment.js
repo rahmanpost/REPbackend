@@ -1,186 +1,251 @@
+// backend/models/shipment.js
 import mongoose from 'mongoose';
+import { dimensionsForBox } from '../utils/boxPresets.js';
 
 const { Schema } = mongoose;
 
-const money = { type: Number, min: 0, default: 0 };
-
-/**
- * Address block used for sender/receiver
- */
-const addressBlockSchema = new Schema(
+/** Structured address (Afghanistan-friendly) */
+const addressSchema = new Schema(
   {
-    name: { type: String, trim: true },
-    phone: { type: String, trim: true },
-    province: { type: String, trim: true },
+    name: { type: String, required: true, trim: true },
+    phone: { type: String, required: true, trim: true },
+    line1: { type: String, required: true, trim: true },
+    line2: { type: String, trim: true },
     district: { type: String, trim: true },
-    street: { type: String, trim: true },
-    details: { type: String, trim: true },
+    city: { type: String, required: true, trim: true },
+    province: { type: String, required: true, trim: true },
+    postalCode: { type: String, trim: true },
+    note: { type: String, trim: true },
   },
   { _id: false }
 );
 
-/**
- * Item line
- */
-const itemSchema = new Schema(
+/** GPS point + audit for live tracking */
+const locationPointSchema = new Schema(
   {
-    description: { type: String, trim: true },
-    quantity: { type: Number, min: 1, default: 1 },
-    weightKg: { type: Number, min: 0 },
-    value: money,
+    lat: { type: Number, min: -90, max: 90 },
+    lng: { type: Number, min: -180, max: 180 },
+    addressText: { type: String, trim: true },
+    at: { type: Date, default: Date.now },
+    by: { type: Schema.Types.ObjectId, ref: 'User' },
   },
   { _id: false }
 );
 
-/**
- * Geo coordinates
- */
-const geoSchema = new Schema(
+/** Log entries for status/location/info */
+const logSchema = new Schema(
   {
-    latitude: { type: Number },
-    longitude: { type: Number },
+    at: { type: Date, default: Date.now },
+    by: { type: Schema.Types.ObjectId, ref: 'User' },
+    type: {
+      type: String,
+      enum: ['INFO', 'WARN', 'ERROR', 'STATUS', 'LOCATION'],
+      default: 'INFO',
+    },
+    message: { type: String, trim: true },
+    data: {},
   },
   { _id: false }
 );
 
-/**
- * File reference (for uploads like beforePhoto, afterPhoto, receipt)
- * Added to support uploadShipmentFiles without breaking existing data.
- */
-const fileRefSchema = new Schema(
+/** Simple file descriptor for /:id/files uploads */
+const fileSchema = new Schema(
   {
-    field: { type: String, trim: true },       // e.g., 'beforePhoto'
-    originalName: { type: String, trim: true },
-    fileName: { type: String, trim: true },
-    mimeType: { type: String, trim: true },
-    size: { type: Number, min: 0 },
-    path: { type: String, trim: true },
-    uploadedAt: { type: Date },
-    uploadedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+    path: { type: String, required: true },
+    filename: { type: String, required: true },
+    mimetype: { type: String },
+    size: { type: Number },
+    uploadedAt: { type: Date, default: Date.now },
+    by: { type: Schema.Types.ObjectId, ref: 'User' },
   },
   { _id: false }
 );
 
-/**
- * Cancellation info (soft cancel)
- */
-const cancellationSchema = new Schema(
+/** Box selector: PRESET (code 3–8) or CUSTOM (cm) */
+const boxTypeSchema = new Schema(
   {
-    reason: { type: String, trim: true, default: 'Cancelled by request' },
-    at: { type: Date },
-    by: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+    kind: { type: String, enum: ['PRESET', 'CUSTOM'], required: true },
+    code: { type: Number, min: 1, max: 999 }, // when PRESET
+    length: { type: Number, min: 1 }, // when CUSTOM (cm)
+    width: { type: Number, min: 1 },
+    height: { type: Number, min: 1 },
   },
   { _id: false }
 );
 
 const shipmentSchema = new Schema(
   {
-    // Parties
-    sender: {
-      type: Schema.Types.ObjectId,
-      ref: 'User',
-      required: true,
-      index: true,
-    },
-
-    // Legacy single agent field kept for compatibility
-    agent: { type: Schema.Types.ObjectId, ref: 'User', default: null },
-
-    // Optional dedicated pickup/delivery agents
+    // Actors
+    sender: { type: Schema.Types.ObjectId, ref: 'User', required: true },
     pickupAgent: { type: Schema.Types.ObjectId, ref: 'User', default: null },
     deliveryAgent: { type: Schema.Types.ObjectId, ref: 'User', default: null },
 
-    // Identifiers
-    invoiceNumber: { type: String, required: true, unique: true, index: true, trim: true },
-    trackingId: {
-      type: String,
-      required: true,
-      unique: true,
-      minlength: 8,
-      maxlength: 40,
-      index: true,
-      // Note: we do NOT force uppercase here to avoid changing legacy docs;
-      // controllers already generate uppercase IDs.
-    },
+    // Identity
+    invoiceNumber: { type: String, required: true, unique: true, index: true },
+    trackingId: { type: String, required: true, unique: true, index: true },
 
-    // Addresses & content
-    from: { type: addressBlockSchema, required: true },
-    to: { type: addressBlockSchema, required: true },
-    items: { type: [itemSchema], default: [] },
+    // Addresses
+    pickupAddress: { type: addressSchema, required: true },
+    deliveryAddress: { type: addressSchema, required: true },
 
-    // Physical attributes
-    weightKg: { type: Number, min: 0 },
+    // Box & dimensions
+    boxType: { type: boxTypeSchema, required: true },
     dimensionsCm: {
-      length: { type: Number, min: 0 },
-      width: { type: Number, min: 0 },
-      height: { type: Number, min: 0 },
+      length: { type: Number, min: 1, required: true },
+      width: { type: Number, min: 1, required: true },
+      height: { type: Number, min: 1, required: true },
     },
 
-    // Financials
-    baseCharge: money,
-    serviceCharge: money,
-    fuelSurcharge: money,
-    otherFees: money,
-    codAmount: money, // Cash on Delivery amount
+    // Weighting
+    weightKg: { type: Number, min: 0, default: 0 }, // physical
+    volumetricDivisor: { type: Number, min: 1, default: 5000 }, // cm³/kg
+    volumetricWeightKg: { type: Number, min: 0, default: 0 },
+    chargeableWeightKg: { type: Number, min: 0, default: 0 },
+
+    // Pricing flags + charges (admin-managed)
+    pricingVersion: { type: Schema.Types.ObjectId, ref: 'Pricing', default: null },
+    needsReprice: { type: Boolean, default: false },
+    actualCharges: { type: Number, min: 0, default: 0 },
+    otherCharges: { type: Number, min: 0, default: 0 },
+    tax: { type: Number, min: 0, default: 0 },
+
+    // COD
     isCOD: { type: Boolean, default: false },
+    codAmount: { type: Number, min: 0, default: 0 },
+
     currency: { type: String, default: 'AFN' },
 
-    // Status (kept flexible to avoid breaking existing flows)
-    status: { type: String, trim: true, default: 'Created', index: true },
-
-    // Timeline
-    pickedUpAt: { type: Date },
-    deliveredAt: { type: Date },
-
-    // Location + logs
-    lastLocation: {
-      province: { type: String, trim: true },
-      district: { type: String, trim: true },
-      geo: { type: geoSchema, default: undefined },
+    // Status flow
+    status: {
+      type: String,
+      enum: [
+        'CREATED',
+        'PICKUP_SCHEDULED',
+        'PICKED_UP',
+        'AT_ORIGIN_HUB',
+        'IN_TRANSIT',
+        'AT_DESTINATION_HUB',
+        'OUT_FOR_DELIVERY',
+        'DELIVERED',
+        'ON_HOLD',
+        'RETURN_TO_SENDER',
+        'CANCELLED',
+      ],
+      default: 'CREATED',
+      index: true,
     },
 
-    notes: { type: String, trim: true },
+    // Live location
+    lastLocation: { type: locationPointSchema, default: null },
+    locationHistory: { type: [locationPointSchema], default: [] },
 
-    // Tracking logs
-    logs: [{ type: Schema.Types.ObjectId, ref: 'TrackingLog' }],
-
-    /**
-     * NEW: Soft-cancel info (used by cancelShipment controller)
-     * If not cancelled, this remains undefined.
-     */
-    cancellation: { type: cancellationSchema, default: undefined },
-
-    /**
-     * NEW: Optional attachments container for uploads
-     * Your controller writes into whichever container exists;
-     * we add 'attachments' so nothing breaks if none existed.
-     */
+    // Attachments for file uploads
     attachments: {
-      beforePhoto: { type: fileRefSchema, default: undefined },
-      afterPhoto:  { type: fileRefSchema, default: undefined },
-      receipt:     { type: fileRefSchema, default: undefined },
+      beforePhoto: { type: fileSchema, default: null },
+      afterPhoto: { type: fileSchema, default: null },
+      receipt: { type: fileSchema, default: null },
     },
+
+    // Notes & logs
+    notes: { type: String, trim: true },
+    logs: { type: [logSchema], default: [] },
+
+    // Cancellation meta
+    cancellation: {
+      reason: { type: String, trim: true },
+      at: { type: Date },
+      by: { type: Schema.Types.ObjectId, ref: 'User' },
+    },
+
+    // Payment meta
+    payment: {
+      mode: { type: String, enum: ['PICKUP', 'DELIVERY'], default: 'DELIVERY' },
+      method: { type: String, enum: ['CASH', 'ONLINE'], default: 'CASH' },
+      status: { type: String, enum: ['UNPAID', 'PAID'], default: 'UNPAID' },
+      collectedAt: { type: Date },
+      collectedBy: { type: Schema.Types.ObjectId, ref: 'User' },
+      transactionId: { type: String },
+    },
+
+    meta: { lastManualEditAt: { type: Date } },
   },
-  {
-    timestamps: true,
-    versionKey: false,
-  }
+  { timestamps: true }
 );
 
-/**
- * Indexes for common access patterns
- */
-shipmentSchema.index({ status: 1, createdAt: -1 });
-shipmentSchema.index({ pickupAgent: 1, createdAt: -1 });
-shipmentSchema.index({ deliveryAgent: 1, createdAt: -1 });
-shipmentSchema.index({ 'from.province': 1, 'to.province': 1 });
+/** Virtual total for convenience (actual + other + tax) */
+shipmentSchema.virtual('grandTotal').get(function () {
+  return (this.actualCharges || 0) + (this.otherCharges || 0) + (this.tax || 0);
+});
 
-// Keep JSON clean
-shipmentSchema.set('toJSON', {
-  versionKey: false,
-  transform(_doc, ret) {
-    return ret;
-  },
+/* -------- Helpers to keep dimensions/weights consistent -------- */
+function resolveDimensions(doc) {
+  const bt = doc.boxType;
+  if (!bt) return null;
+
+  if (bt.kind === 'PRESET' && bt.code != null) {
+    const d = dimensionsForBox(bt.code); // { length, width, height }
+    return { length: d.length, width: d.width, height: d.height };
+  }
+
+  if (bt.kind === 'CUSTOM') {
+    const { length, width, height } = bt;
+    if (length && width && height) return { length, width, height };
+  }
+
+  // Fallback: keep existing dims if present
+  const dims = doc.dimensionsCm;
+  if (dims?.length && dims?.width && dims?.height) return dims;
+
+  return null;
+}
+
+function volumetricFromDimsKg(dims, divisor) {
+  if (!dims) return 0;
+  const volCm3 = (dims.length || 0) * (dims.width || 0) * (dims.height || 0);
+  if (!volCm3 || !divisor) return 0;
+  return +(volCm3 / divisor).toFixed(4);
+}
+
+/** Auto-calc dims + volumetric + chargeable; flag repricing if weight inputs changed */
+shipmentSchema.pre('validate', function (next) {
+  try {
+    const divisor = this.volumetricDivisor || 5000;
+
+    // Derive dimensions from boxType (or keep provided)
+    const dims = resolveDimensions(this);
+    if (dims) this.dimensionsCm = dims;
+
+    // Compute volumetric & chargeable
+    const volKg = volumetricFromDimsKg(this.dimensionsCm, divisor);
+    this.volumetricWeightKg = volKg;
+
+    const physical = this.weightKg || 0;
+    this.chargeableWeightKg = +Math.max(physical, volKg).toFixed(4);
+
+    // If inputs that affect price changed, require repricing
+    if (
+      this.isModified('weightKg') ||
+      this.isModified('dimensionsCm') ||
+      this.isModified('boxType') ||
+      this.isModified('volumetricDivisor')
+    ) {
+      this.needsReprice = true;
+    }
+
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Useful indexes */
+shipmentSchema.index({ createdAt: -1 });
+shipmentSchema.index({ pickupAgent: 1 });
+shipmentSchema.index({ deliveryAgent: 1 });
+shipmentSchema.index({
+  status: 1,
+  'pickupAddress.province': 1,
+  'deliveryAddress.province': 1,
 });
 
 const Shipment = mongoose.model('Shipment', shipmentSchema);

@@ -19,7 +19,7 @@ import userRoutes from './routes/userRoutes.js';
 import adminRoutes from './routes/adminRoutes.js';
 import agentRoutes from './routes/agentRoutes.js';
 import shipmentRoutes from './routes/shipmentRoutes.js';
-import trackingRoutes from './routes/trackingRoutes.js';
+// import trackingRoutes from './routes/trackingRoutes.js'; // ⟵ removed (legacy)
 import invoiceRoutes from './routes/invoiceRoutes.js';
 import publicRoutes from './routes/publicRoutes.js';
 import pricingRoutes from './routes/pricingRoutes.js';
@@ -87,10 +87,10 @@ app.use('/api/users', userRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/agent', agentRoutes);
 app.use('/api/shipments', shipmentRoutes);
-app.use('/api/track', trackingRoutes);
-app.use('/api/invoice', invoiceRoutes);   // ← mount once
-app.use('/api/public', publicRoutes);
-app.use('/api/pricing', pricingRoutes);
+// app.use('/api/track', trackingRoutes); // ⟵ removed (legacy path now /api/public/track/:trackingId)
+app.use('/api/invoice', invoiceRoutes);
+app.use('/api/public', publicRoutes);      // /api/public/track/:trackingId + /api/public/pricing/quote
+app.use('/api/pricing', pricingRoutes);    // admin/user pricing routes you already have
 app.use('/api/upload', uploadRoutes);
 
 // Static files (uploads)

@@ -1,36 +1,46 @@
 // backend/controllers/shipments/listMine.js
 import asyncHandler from 'express-async-handler';
 import Shipment from '../../models/shipment.js';
-import { httpError, toInt } from './_shared.js';
 
 export const getMyShipments = asyncHandler(async (req, res) => {
   const userId = req.user?._id;
-  if (!userId) return httpError(res, 401, 'Unauthorized');
+  if (!userId) {
+    return res.status(401).json({ success: false, message: 'Unauthorized' });
+  }
 
-  const page = Math.max(1, toInt(req.query.page, 1));
-  const limit = Math.min(100, Math.max(1, toInt(req.query.limit, 20)));
-  const skip = (page - 1) * limit;
+  const { status, page = 1, limit = 20, from, to, q } = req.query || {};
 
-  const { q, status, dateFrom, dateTo } = req.query;
-  const filter = { sender: userId };
+  const query = { sender: userId };
+
+  if (status) query.status = String(status).trim().toUpperCase();
+
+  if (from || to) {
+    query.createdAt = {};
+    if (from) query.createdAt.$gte = new Date(from);
+    if (to) query.createdAt.$lte = new Date(to);
+  }
 
   if (q) {
-    filter.$or = [
-      { trackingId: String(q).toUpperCase() },
-      { invoiceNumber: String(q) },
-    ];
+    const term = String(q).trim();
+    if (term) {
+      query.$or = [
+        { invoiceNumber: { $regex: term, $options: 'i' } },
+        { trackingId: { $regex: term, $options: 'i' } },
+      ];
+    }
   }
-  if (status) filter.status = String(status).toUpperCase();
-  if (dateFrom || dateTo) {
-    filter.createdAt = {};
-    if (dateFrom) filter.createdAt.$gte = new Date(dateFrom);
-    if (dateTo) filter.createdAt.$lte = new Date(dateTo);
-  }
+
+  const pageNum = Math.max(1, Number(page) || 1);
+  const limitNum = Math.min(100, Math.max(1, Number(limit) || 20));
+  const skip = (pageNum - 1) * limitNum;
 
   const [items, total] = await Promise.all([
-    Shipment.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
-    Shipment.countDocuments(filter),
+    Shipment.find(query).sort({ createdAt: -1 }).skip(skip).limit(limitNum).lean(),
+    Shipment.countDocuments(query),
   ]);
 
-  res.json({ success: true, page, limit, total, data: items });
+  return res.json({
+    success: true,
+    data: { items, total, page: pageNum, limit: limitNum },
+  });
 });

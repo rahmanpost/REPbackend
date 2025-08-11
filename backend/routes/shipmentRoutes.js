@@ -12,6 +12,7 @@ import {
   uploadShipmentFiles,
   updateShipmentStatus,
   assignAgent, // ← NEW
+  updateShipmentLocation,
 } from '../controllers/shipments/index.js';
 
 import {
@@ -21,6 +22,7 @@ import {
   updateStatusBody,
   listShipmentsQuery,
   assignAgentBody, // ← NEW
+  pushLocationBody,
 } from '../validators/shipmentSchemas.js';
 
 import { downloadInvoice } from '../controllers/invoiceController.js';
@@ -97,5 +99,14 @@ router.get('/:id/invoice', protect, validate(shipmentIdParams, 'params'), downlo
 
 /** By id (keep last so specific routes above take precedence) */
 router.get('/:id', protect, validate(shipmentIdParams, 'params'), getShipmentByIdForUser);
+
+router.patch(
+  '/:id/location',
+  protect,
+  isAgent,
+  validate(shipmentIdParams, 'params'),
+  validate(pushLocationBody),
+  updateShipmentLocation
+);
 
 export default router;

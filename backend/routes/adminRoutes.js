@@ -2,19 +2,14 @@
 import express from 'express';
 import { protect, isAdmin } from '../middleware/authMiddleware.js';
 
-// Pricing + dashboard + shipment admin ops live in adminController.js
+// --- keep your existing admin controllers for users/agents/dashboard ---
 import {
-  createOrUpdatePricing,
-  getAllPricing,
-  getPricingByRoute,
-  deletePricing,
-  assignAgentToShipment,
+  assignAgentToShipment,   // if you still use this standalone endpoint
   getAllShipments,
   getShipmentById,
   getDashboardStats,
 } from '../controllers/adminController.js';
 
-// Admin user management endpoints
 import {
   getAllUsers,
   getUserById,
@@ -22,7 +17,6 @@ import {
   deleteUserById,
 } from '../controllers/adminUserController.js';
 
-// Admin agent management endpoints
 import {
   createAgent,
   getAllAgents,
@@ -31,23 +25,39 @@ import {
   deleteAgent,
 } from '../controllers/adminAgentController.js';
 
-// New: pricing quote preview (admin GET) + shipment reprice
-import { adminQuotePreview } from '../controllers/pricingController.js';
-import { repriceShipment } from '../controllers/shipmentController.js';
+// --- NEW: use upgraded pricing controller ---
+import {
+  createPricing,
+  listPricing,
+  getPricing as getPricingById,   // alias exported by controller
+  updatePricing,
+  deletePricing,
+  getActivePricing,
+  setActivePricing,
+  adminQuotePreview,              // GET /api/admin/pricing/quote
+} from '../controllers/pricingController.js';
+
+// --- NEW: shipment repricing (preview/apply) ---
+import {
+  previewReprice,
+  repriceShipment,
+} from '../controllers/shipments/reprice.js';
 
 const router = express.Router();
 
 /**
- * Pricing management (Admin)
+ * Pricing (Admin)
+ * Replaces legacy createOrUpdatePricing/getPricingByRoute etc.
  */
-router.post('/pricing', protect, isAdmin, createOrUpdatePricing);
-router.get('/pricing', protect, isAdmin, getAllPricing);
-router.get('/pricing/:fromProvince/:toProvince', protect, isAdmin, getPricingByRoute);
-router.delete('/pricing/:fromProvince/:toProvince', protect, isAdmin, deletePricing);
+router.post('/pricing', protect, isAdmin, createPricing);
+router.get('/pricing', protect, isAdmin, listPricing);
+router.get('/pricing/active', protect, isAdmin, getActivePricing);
+router.get('/pricing/:id', protect, isAdmin, getPricingById);
+router.patch('/pricing/:id', protect, isAdmin, updatePricing);
+router.patch('/pricing/:id/activate', protect, isAdmin, setActivePricing);
+router.delete('/pricing/:id', protect, isAdmin, deletePricing);
 
-// NEW: Admin GET quote preview using query params
-// Example:
-//   GET /api/admin/pricing/quote?weightKg=2.5&pieces=1&serviceType=EXPRESS&zoneName=DOMESTIC&isCOD=true&codAmount=2500&length=30&width=20&height=15
+// Admin quote preview (uses active pricing unless you pass pricingVersion in body)
 router.get('/pricing/quote', protect, isAdmin, adminQuotePreview);
 
 /**
@@ -56,10 +66,11 @@ router.get('/pricing/quote', protect, isAdmin, adminQuotePreview);
 router.get('/shipments', protect, isAdmin, getAllShipments);
 router.get('/shipments/:id', protect, isAdmin, getShipmentById);
 
-// Assign agent to a shipment
+// Optional: if you still want a separate admin assign-agent endpoint
 router.put('/assign-agent', protect, isAdmin, assignAgentToShipment);
 
-// NEW: Recompute charges for a shipment using current active pricing
+// Repricing: preview + apply
+router.get('/shipments/:id/reprice/preview', protect, isAdmin, previewReprice);
 router.patch('/shipments/:id/reprice', protect, isAdmin, repriceShipment);
 
 /**

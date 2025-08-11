@@ -1,262 +1,333 @@
 // backend/controllers/pricingController.js
-import asyncHandler from 'express-async-handler';
+import mongoose from 'mongoose';
 import Pricing from '../models/pricing.js';
-import { computeTotals } from '../utils/pricing/calc.js';
+import computeTotals from '../utils/computeTotals.js';
+import { BOX_PRESETS } from '../utils/boxPresets.js';
 
-/* ---------------- In-memory cache for active pricing ---------------- */
-let ACTIVE_CACHE = { version: null, pricing: null, cachedAt: 0 };
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+/* ----------------------------- tiny helpers ----------------------------- */
+const httpError = (res, code, message) =>
+  res.status(code).json({ success: false, message });
 
-async function getActivePricingCached() {
-  const now = Date.now();
-  if (ACTIVE_CACHE.pricing && now - ACTIVE_CACHE.cachedAt < CACHE_TTL_MS) {
-    return ACTIVE_CACHE.pricing;
+const asNum = (v) => (typeof v === 'string' ? Number(v) : v);
+const isPos = (v) => Number.isFinite(v) && v > 0;
+const isNonNeg = (v) => Number.isFinite(v) && v >= 0;
+
+const presetCodes = Object.keys(BOX_PRESETS).map(Number);
+
+/** Map GET-style inputs to a normalized quote payload */
+function normalizeQuoteInput(src = {}) {
+  const obj = { ...src };
+  // Support ?boxCode=3
+  if (!obj.boxType && obj.boxCode != null && obj.boxCode !== '') {
+    obj.boxType = { kind: 'PRESET', code: Number(obj.boxCode) };
   }
-  const doc = await Pricing.findOne({ active: true }).sort({ updatedAt: -1 }).lean();
-  if (doc) ACTIVE_CACHE = { version: doc.version, pricing: doc, cachedAt: now };
-  return doc;
-}
-function bustCache() {
-  ACTIVE_CACHE = { version: null, pricing: null, cachedAt: 0 };
-}
-
-/* ---------------- Small helpers ---------------- */
-const asNum = (v, d = undefined) => {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : d;
-};
-function validatePricingBody(body, { partial = false } = {}) {
-  const errors = [];
-
-  const must = (cond, msg) => { if (!cond) errors.push(msg); };
-
-  if (!partial) {
-    must(!!body.version, 'version is required');
+  // Support flat ?length&width&height
+  if (!obj.dimensionsCm && obj.length != null && obj.width != null && obj.height != null) {
+    obj.dimensionsCm = {
+      length: Number(obj.length),
+      width: Number(obj.width),
+      height: Number(obj.height),
+    };
   }
+  // Coerce weight & divisor
+  if (obj.weightKg != null) obj.weightKg = asNum(obj.weightKg);
+  if (obj.volumetricDivisor != null) obj.volumetricDivisor = asNum(obj.volumetricDivisor);
+  return obj;
+}
 
-  // Optional numeric checks (ignore undefined fields on partial)
-  const nums = [
-    ['defaultBasePerKg', 0],
-    ['defaultBasePerPiece', 0],
-    ['defaultMinCharge', 0],
-    ['fuelSurchargePct', 0],
-    ['codFeePct', 0],
-    ['codFeeMin', 0],
-    ['otherFixedFees', 0],
-  ];
-  for (const [key, min] of nums) {
-    if (body[key] !== undefined) {
-      const n = asNum(body[key], NaN);
-      if (!Number.isFinite(n) || n < min) errors.push(`${key} must be a number >= ${min}`);
+async function loadActiveOrVersion(versionId) {
+  if (versionId) {
+    if (!mongoose.Types.ObjectId.isValid(versionId)) throw new Error('Invalid pricingVersion id');
+    const p = await Pricing.findById(versionId);
+    if (!p) throw new Error('pricingVersion not found');
+    return p;
+  }
+  const active = await Pricing.findOne({ active: true, archived: { $ne: true } }).sort({ updatedAt: -1 });
+  if (!active) throw new Error('No active pricing configured');
+  return active;
+}
+
+/* ----------------------------- CRUD (admin) ----------------------------- */
+
+// POST /api/pricing
+export const createPricing = async (req, res) => {
+  try {
+    const {
+      name,
+      mode = 'WEIGHT',
+      baseFee = 0,
+      minCharge = 0,
+      taxPercent = 0,
+      perKg = 0,
+      pricePerCubicCm = 0,
+      pricePerCubicMeter = 0,
+      volumetricDivisor = 5000,
+      active = false,
+      notes = '',
+      currency = 'AFN',
+    } = req.body || {};
+
+    const m = String(mode).toUpperCase();
+    if (!['WEIGHT', 'VOLUME'].includes(m)) return httpError(res, 400, 'mode must be WEIGHT or VOLUME');
+
+    if (!name || !String(name).trim()) return httpError(res, 400, 'name is required');
+
+    if (!isNonNeg(asNum(baseFee)) || !isNonNeg(asNum(minCharge)) || !isNonNeg(asNum(taxPercent))) {
+      return httpError(res, 400, 'baseFee, minCharge, taxPercent must be non-negative numbers');
     }
+
+    if (!isPos(asNum(volumetricDivisor))) {
+      return httpError(res, 400, 'volumetricDivisor must be > 0');
+    }
+
+    if (m === 'WEIGHT') {
+      if (!isPos(asNum(perKg))) return httpError(res, 400, 'perKg must be > 0 in WEIGHT mode');
+    } else {
+      const byM3 = isPos(asNum(pricePerCubicMeter));
+      const byCm3 = isPos(asNum(pricePerCubicCm));
+      if (!byM3 && !byCm3) return httpError(res, 400, 'Provide pricePerCubicMeter or pricePerCubicCm in VOLUME mode');
+    }
+
+    if (active) {
+      await Pricing.updateMany({ active: true }, { $set: { active: false } });
+    }
+
+    const doc = await Pricing.create({
+      name: String(name).trim(),
+      mode: m,
+      baseFee: asNum(baseFee) ?? 0,
+      minCharge: asNum(minCharge) ?? 0,
+      taxPercent: asNum(taxPercent) ?? 0,
+      perKg: asNum(perKg) ?? 0,
+      pricePerCubicCm: asNum(pricePerCubicCm) ?? 0,
+      pricePerCubicMeter: asNum(pricePerCubicMeter) ?? 0,
+      volumetricDivisor: asNum(volumetricDivisor) ?? 5000,
+      active: !!active,
+      notes,
+      currency: String(currency || 'AFN').toUpperCase(),
+      createdBy: req.user?._id,
+      updatedBy: req.user?._id,
+    });
+
+    return res.status(201).json({ success: true, data: doc });
+  } catch (err) {
+    return httpError(res, 400, err.message || 'Failed to create pricing');
   }
+};
 
-  // zones/serviceMultipliers if present must be arrays
-  if (body.zones !== undefined && !Array.isArray(body.zones)) errors.push('zones must be an array');
-  if (body.serviceMultipliers !== undefined && !Array.isArray(body.serviceMultipliers)) errors.push('serviceMultipliers must be an array');
+// PATCH /api/pricing/:id
+export const updatePricing = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) return httpError(res, 400, 'Invalid id');
+    const doc = await Pricing.findById(id);
+    if (!doc) return httpError(res, 404, 'Pricing not found');
 
-  return errors;
-}
+    const body = req.body || {};
+    if (body.mode) {
+      const m = String(body.mode).toUpperCase();
+      if (!['WEIGHT', 'VOLUME'].includes(m)) return httpError(res, 400, 'mode must be WEIGHT or VOLUME');
+      doc.mode = m;
+    }
+    for (const k of ['name', 'notes', 'currency']) {
+      if (k in body) doc[k] = k === 'currency' ? String(body[k]).toUpperCase() : String(body[k]).trim();
+    }
+    for (const k of ['baseFee', 'minCharge', 'taxPercent', 'perKg', 'pricePerCubicCm', 'pricePerCubicMeter', 'volumetricDivisor']) {
+      if (k in body) {
+        const n = asNum(body[k]);
+        if (!Number.isFinite(n)) return httpError(res, 400, `${k} must be a number`);
+        doc[k] = n;
+      }
+    }
 
-/* ---------------- Admin: create pricing ---------------- */
-export const createPricing = asyncHandler(async (req, res) => {
-  const body = req.body || {};
-  const errors = validatePricingBody(body);
-  if (errors.length) return res.status(400).json({ success: false, message: errors.join('; ') });
+    // sanity checks
+    if (doc.mode === 'WEIGHT' && !isPos(doc.perKg)) {
+      return httpError(res, 400, 'perKg must be > 0 in WEIGHT mode');
+    }
+    if (doc.mode === 'VOLUME') {
+      const byM3 = isPos(doc.pricePerCubicMeter);
+      const byCm3 = isPos(doc.pricePerCubicCm);
+      if (!byM3 && !byCm3) return httpError(res, 400, 'Provide pricePerCubicMeter or pricePerCubicCm in VOLUME mode');
+    }
+    if (!isPos(doc.volumetricDivisor)) {
+      return httpError(res, 400, 'volumetricDivisor must be > 0');
+    }
 
-  if (body.active === true) {
+    doc.updatedBy = req.user?._id;
+    await doc.save();
+    return res.json({ success: true, data: doc });
+  } catch (err) {
+    return httpError(res, 400, err.message || 'Failed to update pricing');
+  }
+};
+
+// PATCH /api/pricing/:id/activate
+export const setActivePricing = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) return httpError(res, 400, 'Invalid id');
+
+    const target = await Pricing.findById(id);
+    if (!target) return httpError(res, 404, 'Pricing not found');
+    if (target.archived) return httpError(res, 400, 'Cannot activate an archived pricing');
+
     await Pricing.updateMany({ active: true }, { $set: { active: false } });
+    target.active = true;
+    target.updatedBy = req.user?._id;
+    await target.save();
+
+    return res.json({ success: true, data: target });
+  } catch (err) {
+    return httpError(res, 400, err.message || 'Failed to set active pricing');
   }
+};
 
-  const doc = await Pricing.create({
-    currency: body.currency ? String(body.currency).toUpperCase().trim() : 'AFN',
-    defaultBasePerKg: asNum(body.defaultBasePerKg, 0),
-    defaultBasePerPiece: asNum(body.defaultBasePerPiece, 0),
-    defaultMinCharge: asNum(body.defaultMinCharge, 0),
-    zones: Array.isArray(body.zones) ? body.zones : [],
-    serviceMultipliers: Array.isArray(body.serviceMultipliers) ? body.serviceMultipliers : [],
-    fuelSurchargePct: asNum(body.fuelSurchargePct, 0),
-    codFeePct: asNum(body.codFeePct, 0),
-    codFeeMin: asNum(body.codFeeMin, 0),
-    otherFixedFees: asNum(body.otherFixedFees, 0),
-    version: String(body.version),
-    active: body.active !== false,
-    notes: body.notes || '',
-  });
+// GET /api/pricing/active
+export const getActivePricing = async (_req, res) => {
+  const active = await Pricing.findOne({ active: true, archived: { $ne: true } }).sort({ updatedAt: -1 });
+  if (!active) return httpError(res, 404, 'No active pricing configured');
+  return res.json({ success: true, data: active });
+};
 
-  bustCache();
-  res.status(201).json({ success: true, data: doc });
-});
+// GET /api/pricing/:id
+export const getPricingById = async (req, res) => {
+  const { id } = req.params;
+  if (!mongoose.Types.ObjectId.isValid(id)) return httpError(res, 400, 'Invalid id');
+  const doc = await Pricing.findById(id);
+  if (!doc) return httpError(res, 404, 'Pricing not found');
+  return res.json({ success: true, data: doc });
+};
 
-/* ---------------- Admin: list pricing versions ---------------- */
-export const listPricing = asyncHandler(async (_req, res) => {
-  const docs = await Pricing.find().sort({ active: -1, updatedAt: -1 }).lean();
-  res.json({ success: true, data: docs });
-});
+// Alias some routes expect
+export const getPricing = getPricingById;
 
-/* ---------------- Admin: get a pricing doc ---------------- */
-export const getPricing = asyncHandler(async (req, res) => {
-  const doc = await Pricing.findById(req.params.id).lean();
-  if (!doc) return res.status(404).json({ success: false, message: 'Not found' });
-  res.json({ success: true, data: doc });
-});
+// GET /api/pricing
+export const listPricing = async (req, res) => {
+  const page = Math.max(1, Number(req.query?.page) || 1);
+  const limit = Math.min(100, Math.max(1, Number(req.query?.limit) || 20));
+  const includeArchived = String(req.query?.includeArchived ?? 'false') === 'true';
 
-/* ---------------- Admin: update pricing ---------------- */
-export const updatePricing = asyncHandler(async (req, res) => {
-  const id = req.params.id;
-  const body = req.body || {};
-  const errors = validatePricingBody(body, { partial: true });
-  if (errors.length) return res.status(400).json({ success: false, message: errors.join('; ') });
+  const q = includeArchived ? {} : { archived: { $ne: true } };
+  const skip = (page - 1) * limit;
 
-  if (body.active === true) {
-    await Pricing.updateMany({ _id: { $ne: id }, active: true }, { $set: { active: false } });
+  const [items, total] = await Promise.all([
+    Pricing.find(q).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+    Pricing.countDocuments(q),
+  ]);
+
+  return res.json({ success: true, data: { items, total, page, limit } });
+};
+
+// DELETE /api/pricing/:id (soft)
+export const deletePricing = async (req, res) => {
+  const { id } = req.params;
+  if (!mongoose.Types.ObjectId.isValid(id)) return httpError(res, 400, 'Invalid id');
+  const doc = await Pricing.findById(id);
+  if (!doc) return httpError(res, 404, 'Pricing not found');
+  doc.archived = true;
+  doc.active = false;
+  doc.updatedBy = req.user?._id;
+  await doc.save();
+  return res.json({ success: true, data: doc });
+};
+
+/* ----------------------------- Quotes ----------------------------- */
+
+// GET or POST /api/pricing/quote  (public; uses ACTIVE pricing)
+export const getQuote = async (req, res) => {
+  try {
+    const src = req.method === 'GET' ? req.query : req.body;
+    const body = normalizeQuoteInput(src);
+
+    // Validate input
+    const weightKg = asNum(body.weightKg);
+    if (!isNonNeg(weightKg)) return httpError(res, 400, 'weightKg must be a non-negative number');
+
+    let dims = null;
+    if (body.boxType?.kind === 'PRESET') {
+      const code = Number(body.boxType.code);
+      if (!presetCodes.includes(code)) return httpError(res, 400, `boxType.code must be one of: ${presetCodes.join(', ')}`);
+      // computeTotals will derive dims from code
+    } else if (body.boxType?.kind === 'CUSTOM') {
+      const { length, width, height } = body.boxType;
+      if (!isPos(asNum(length)) || !isPos(asNum(width)) || !isPos(asNum(height))) {
+        return httpError(res, 400, 'CUSTOM boxType requires positive length/width/height');
+      }
+    } else if (body.dimensionsCm) {
+      const { length, width, height } = body.dimensionsCm;
+      if (!isPos(asNum(length)) || !isPos(asNum(width)) || !isPos(asNum(height))) {
+        return httpError(res, 400, 'dimensionsCm requires positive length/width/height');
+      }
+      dims = { length: asNum(length), width: asNum(width), height: asNum(height) };
+    } else {
+      return httpError(res, 400, 'Provide boxType (PRESET or CUSTOM) or dimensionsCm');
+    }
+
+    const pricing = await loadActiveOrVersion(undefined);
+    const shipmentLike = {
+      boxType: body.boxType,
+      dimensionsCm: dims,
+      weightKg,
+      volumetricDivisor: asNum(body.volumetricDivisor) || pricing.volumetricDivisor || 5000,
+    };
+
+    const totals = computeTotals(shipmentLike, pricing.toObject());
+    return res.json({ success: true, data: { pricingVersion: pricing._id, totals } });
+  } catch (err) {
+    return httpError(res, 400, err.message || 'Failed to compute quote');
   }
+};
 
-  const set = {};
-  if (body.currency !== undefined) set.currency = String(body.currency).toUpperCase().trim();
-  if (body.version !== undefined) set.version = String(body.version);
-  if (body.notes !== undefined) set.notes = body.notes;
+// POST /api/admin/quote/preview  (admin; allows pricingVersion override)
+export const adminQuotePreview = async (req, res) => {
+  try {
+    const src = req.body || {};
+    const body = normalizeQuoteInput(src);
 
-  const numeric = [
-    'defaultBasePerKg',
-    'defaultBasePerPiece',
-    'defaultMinCharge',
-    'fuelSurchargePct',
-    'codFeePct',
-    'codFeeMin',
-    'otherFixedFees',
-  ];
-  for (const k of numeric) if (body[k] !== undefined) set[k] = asNum(body[k], 0);
-  if (body.zones !== undefined) set.zones = Array.isArray(body.zones) ? body.zones : [];
-  if (body.serviceMultipliers !== undefined) set.serviceMultipliers = Array.isArray(body.serviceMultipliers) ? body.serviceMultipliers : [];
-  if (body.active !== undefined) set.active = !!body.active;
+    const weightKg = asNum(body.weightKg);
+    if (!isNonNeg(weightKg)) return httpError(res, 400, 'weightKg must be a non-negative number');
 
-  const doc = await Pricing.findByIdAndUpdate(id, { $set: set }, { new: true }).lean();
-  if (!doc) return res.status(404).json({ success: false, message: 'Not found' });
+    if (body.boxType?.kind === 'PRESET') {
+      const code = Number(body.boxType.code);
+      if (!presetCodes.includes(code)) return httpError(res, 400, `boxType.code must be one of: ${presetCodes.join(', ')}`);
+    } else if (body.boxType?.kind === 'CUSTOM') {
+      const { length, width, height } = body.boxType;
+      if (!isPos(asNum(length)) || !isPos(asNum(width)) || !isPos(asNum(height))) {
+        return httpError(res, 400, 'CUSTOM boxType requires positive length/width/height');
+      }
+    } else if (body.dimensionsCm) {
+      const { length, width, height } = body.dimensionsCm;
+      if (!isPos(asNum(length)) || !isPos(asNum(width)) || !isPos(asNum(height))) {
+        return httpError(res, 400, 'dimensionsCm requires positive length/width/height');
+      }
+    } else {
+      return httpError(res, 400, 'Provide boxType (PRESET or CUSTOM) or dimensionsCm');
+    }
 
-  bustCache();
-  res.json({ success: true, data: doc });
-});
+    const pricing = await loadActiveOrVersion(body.pricingVersion);
+    const shipmentLike = {
+      boxType: body.boxType,
+      dimensionsCm: body.dimensionsCm,
+      weightKg,
+      volumetricDivisor: asNum(body.volumetricDivisor) || pricing.volumetricDivisor || 5000,
+    };
 
-/* ---------------- Admin: delete/deactivate pricing ---------------- */
-export const deletePricing = asyncHandler(async (req, res) => {
-  const hard = String(req.query.hard || '').toLowerCase() === 'true';
-  if (hard) await Pricing.findByIdAndDelete(req.params.id);
-  else await Pricing.findByIdAndUpdate(req.params.id, { $set: { active: false } });
-
-  bustCache();
-  res.json({ success: true, message: hard ? 'Deleted' : 'Deactivated' });
-});
-
-/* ---------------- Public/Agent: get active (cached) ---------------- */
-export const getActivePricing = asyncHandler(async (_req, res) => {
-  const doc = await getActivePricingCached();
-  if (!doc) return res.status(404).json({ success: false, message: 'No active pricing found' });
-  res.json({ success: true, data: doc });
-});
-
-/* ---------------- Public/Agent: quote ---------------- */
-/**
- * Body: {
- *   weightKg, pieces, serviceType, isCOD, codAmount,
- *   zoneName (optional)
- * }
- */
-export const getQuote = asyncHandler(async (req, res) => {
-  const pricing = await getActivePricingCached();
-  if (!pricing) return res.status(404).json({ success: false, message: 'No active pricing found' });
-
-  const input = req.body || {};
-  // Basic validation
-  if (input.weightKg == null && input.pieces == null) {
-    return res.status(400).json({ success: false, message: 'Provide weightKg and/or pieces.' });
+    const totals = computeTotals(shipmentLike, pricing.toObject());
+    return res.json({ success: true, data: { pricingVersion: pricing._id, totals } });
+  } catch (err) {
+    return httpError(res, 400, err.message || 'Failed to compute admin preview');
   }
-  if (input.weightKg != null && !Number.isFinite(Number(input.weightKg))) {
-    return res.status(400).json({ success: false, message: 'weightKg must be a number.' });
-  }
-  if (input.pieces != null && !Number.isFinite(Number(input.pieces))) {
-    return res.status(400).json({ success: false, message: 'pieces must be a number.' });
-  }
-  if (input.codAmount != null && !Number.isFinite(Number(input.codAmount))) {
-    return res.status(400).json({ success: false, message: 'codAmount must be a number.' });
-  }
+};
 
-  const result = computeTotals(input, pricing);
-  res.json({ success: true, data: result });
-});
-
-
-
-
-
-
-
-// (reuse existing cache if you have it; otherwise this tiny helper is fine)
-let ADMIN_ACTIVE_CACHE = { pricing: null, ts: 0 };
-const ADMIN_CACHE_TTL = 10 * 60 * 1000;
-
-async function getActivePricingForAdmin() {
-  const now = Date.now();
-  if (ADMIN_ACTIVE_CACHE.pricing && now - ADMIN_ACTIVE_CACHE.ts < ADMIN_CACHE_TTL) {
-    return ADMIN_ACTIVE_CACHE.pricing;
-  }
-  const doc = await Pricing.findOne({ active: true }).sort({ updatedAt: -1 }).lean();
-  if (doc) ADMIN_ACTIVE_CACHE = { pricing: doc, ts: now };
-  return doc;
-}
-
-/**
- * GET /api/admin/pricing/quote
- * Query params:
- *   weightKg, pieces, serviceType, zoneName, isCOD, codAmount, length, width, height
- * Example:
- *   /api/admin/pricing/quote?weightKg=2.5&pieces=1&serviceType=EXPRESS&zoneName=DOMESTIC&isCOD=true&codAmount=2500&length=30&width=20&height=15
- */
-export const adminQuotePreview = asyncHandler(async (req, res) => {
-  const pricing = await getActivePricingForAdmin();
-  if (!pricing) return res.status(404).json({ success: false, message: 'No active pricing found' });
-
-  const q = req.query || {};
-  const num = (v) => (v == null ? undefined : Number(v));
-  const bool = (v) => {
-    if (v == null) return false;
-    const s = String(v).toLowerCase().trim();
-    return s === '1' || s === 'true' || s === 'yes';
-  };
-
-  // Validate numeric inputs when present
-  const errors = [];
-  for (const [key, label] of [
-    ['weightKg', 'weightKg'],
-    ['pieces', 'pieces'],
-    ['codAmount', 'codAmount'],
-    ['length', 'length'],
-    ['width', 'width'],
-    ['height', 'height'],
-  ]) {
-    if (q[key] != null && !Number.isFinite(Number(q[key]))) errors.push(`${label} must be a number`);
-  }
-  if (errors.length) {
-    return res.status(400).json({ success: false, message: errors.join('; ') });
-  }
-
-  const input = {
-    weightKg: num(q.weightKg) ?? 0,
-    pieces: num(q.pieces) ?? 1,
-    serviceType: q.serviceType || 'EXPRESS',
-    zoneName: q.zoneName,
-    isCOD: bool(q.isCOD),
-    codAmount: num(q.codAmount) ?? 0,
-    dimensionsCm:
-      q.length || q.width || q.height
-        ? {
-            length: num(q.length) ?? 0,
-            width: num(q.width) ?? 0,
-            height: num(q.height) ?? 0,
-          }
-        : {},
-  };
-
-  const result = computeTotals(input, pricing);
-  return res.json({ success: true, data: result, input });
-});
+export default {
+  createPricing,
+  updatePricing,
+  setActivePricing,
+  getActivePricing,
+  getPricingById,
+  getPricing,
+  listPricing,
+  deletePricing,
+  getQuote,
+  adminQuotePreview,
+};

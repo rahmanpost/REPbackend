@@ -1,25 +1,54 @@
 // backend/controllers/shipments/updateStatus.js
 import asyncHandler from 'express-async-handler';
 import Shipment from '../../models/shipment.js';
+import { assertTransition } from '../../validators/shipmentSchemas.js';
 import { httpError } from './_shared.js';
 
 export const updateShipmentStatus = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const { status, notes } = req.body || {};
+  const { status, reason, notes } = req.body || {};
 
-  const role = String(req.user?.role || 'USER').toUpperCase();
-  if (role !== 'AGENT' && role !== 'ADMIN') {
-    return httpError(res, 403, 'Forbidden');
+  const s = await Shipment.findById(id).select('_id status');
+  if (!s) return httpError(res, 404, 'Shipment not found.');
+
+  // Enforce lifecycle rule
+  try {
+    assertTransition(s.status, status);
+  } catch (e) {
+    return httpError(res, 400, e?.message || 'Invalid status transition');
   }
 
-  if (!status) return httpError(res, 400, 'status is required.');
+  // Require a reason for specific statuses
+  const needReason = status === 'CANCELLED' || status === 'ON_HOLD' || status === 'RETURN_TO_SENDER';
+  if (needReason && !reason) {
+    return httpError(res, 400, 'Reason is required for this status.');
+  }
 
-  const shipment = await Shipment.findById(id);
-  if (!shipment) return httpError(res, 404, 'Shipment not found.');
+  const prev = s.status;
+  const now = new Date();
 
-  shipment.status = String(status).toUpperCase();
-  if (notes != null) shipment.notes = String(notes);
+  const update = {
+    $set: { status },
+    $push: {
+      logs: {
+        type: 'STATUS',
+        message: `Status changed ${prev} -> ${status}${reason ? ` (${reason})` : ''}${notes ? ` — ${notes}` : ''}`,
+        at: now,
+        by: req.user?._id,
+      },
+    },
+  };
 
-  await shipment.save();
-  res.json({ success: true, data: shipment });
+  if (status === 'CANCELLED') {
+    update.$set.cancellation = {
+      reason: reason || 'Cancelled',
+      at: now,
+      by: req.user?._id,
+    };
+  }
+
+  // Atomic write; skip full validation to support legacy records
+  await Shipment.updateOne({ _id: s._id }, update, { runValidators: false });
+
+  return res.json({ success: true, data: { status } });
 });

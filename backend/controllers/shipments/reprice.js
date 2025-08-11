@@ -1,62 +1,119 @@
 // backend/controllers/shipments/reprice.js
 import asyncHandler from 'express-async-handler';
+import mongoose from 'mongoose';
 import Shipment from '../../models/shipment.js';
 import Pricing from '../../models/pricing.js';
-import { computeTotals } from '../../utils/pricing/calc.js';
+import computeTotals from '../../utils/computeTotals.js';
 import { httpError } from './_shared.js';
 
+const loadPricing = async (pricingVersion) => {
+  if (pricingVersion) {
+    if (!mongoose.Types.ObjectId.isValid(pricingVersion)) {
+      throw new Error('Invalid pricingVersion id');
+    }
+    const p = await Pricing.findById(pricingVersion);
+    if (!p) throw new Error('pricingVersion not found');
+    return p;
+  }
+  // prefer active + not archived; fall back to any active
+  let p = await Pricing.findOne({ active: true, archived: { $ne: true } }).sort({ updatedAt: -1 });
+  if (!p) p = await Pricing.findOne({ active: true }).sort({ updatedAt: -1 });
+  if (!p) throw new Error('No active pricing configured');
+  return p;
+};
+
+const toShipmentLike = (s, divisor) => ({
+  boxType: s.boxType,
+  dimensionsCm: s.dimensionsCm, // ok for legacy docs that only have dimensionsCm
+  weightKg: s.weightKg ?? 0,
+  volumetricDivisor: divisor ?? s.volumetricDivisor ?? 5000,
+});
+
+/**
+ * GET /api/admin/shipments/:id/reprice/preview?pricingVersion=<id>
+ * Roles: Admin (enforced in route/middleware)
+ */
+export const previewReprice = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  if (!mongoose.Types.ObjectId.isValid(id)) return httpError(res, 400, 'Invalid shipment id.');
+
+  const s = await Shipment.findById(id);
+  if (!s) return httpError(res, 404, 'Shipment not found.');
+
+  try {
+    const p = await loadPricing(req.query?.pricingVersion);
+    const totals = computeTotals(toShipmentLike(s, p.volumetricDivisor), p.toObject());
+    return res.json({
+      success: true,
+      data: {
+        shipmentId: s._id,
+        pricingVersion: p._id,
+        totals,
+      },
+    });
+  } catch (err) {
+    return httpError(res, 400, err.message || 'Failed to preview repricing');
+  }
+});
+
+/**
+ * PATCH /api/admin/shipments/:id/reprice
+ * Body: { pricingVersion?: string, otherCharges?: number }
+ * Roles: Admin (enforced in route/middleware)
+ */
 export const repriceShipment = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const role = String(req.user?.role || '').toUpperCase();
-  if (role !== 'ADMIN' && role !== 'AGENT') {
-    return httpError(res, 403, 'Forbidden');
+  const { pricingVersion, otherCharges } = req.body || {};
+
+  if (!mongoose.Types.ObjectId.isValid(id)) return httpError(res, 400, 'Invalid shipment id.');
+  if (otherCharges != null && !(Number.isFinite(Number(otherCharges)) && Number(otherCharges) >= 0)) {
+    return httpError(res, 400, 'otherCharges must be a non-negative number');
   }
 
-  const shipment = await Shipment.findById(id);
-  if (!shipment) return httpError(res, 404, 'Shipment not found.');
+  const s = await Shipment.findById(id);
+  if (!s) return httpError(res, 404, 'Shipment not found.');
 
-  const version = req.query.version ? String(req.query.version) : null;
-  let pricing;
-  if (version) {
-    pricing = await Pricing.findOne({ version }).lean();
-    if (!pricing) return httpError(res, 404, `Pricing version "${version}" not found.`);
-  } else {
-    pricing = await Pricing.findOne({ active: true }).lean();
-    if (!pricing) return httpError(res, 404, 'No active pricing found.');
+  try {
+    const p = await loadPricing(pricingVersion);
+    const totals = computeTotals(toShipmentLike(s, p.volumetricDivisor), p.toObject());
+
+    // 🔒 Atomic update: set only computed/price fields; skip full validation
+    const update = {
+      $set: {
+        actualCharges: totals.actualCharges,
+        tax: totals.tax,
+        volumetricDivisor: totals.volumetricDivisor,
+        volumetricWeightKg: totals.volumetricWeightKg,
+        chargeableWeightKg: totals.chargeableWeightKg,
+        pricingVersion: p._id,
+        needsReprice: false,
+      },
+      $push: {
+        logs: {
+          type: 'INFO',
+          message: `Repriced with version=${p._id} (grandTotal=${totals.grandTotal.toFixed(2)})`,
+          at: new Date(),
+          by: req.user?._id,
+          data: totals.breakdown,
+        },
+      },
+    };
+
+    if (otherCharges != null) {
+      update.$set.otherCharges = Number(otherCharges);
+    }
+
+    await Shipment.updateOne({ _id: s._id }, update, { runValidators: false });
+
+    return res.json({
+      success: true,
+      data: {
+        shipmentId: s._id,
+        pricingVersion: p._id,
+        totals,
+      },
+    });
+  } catch (err) {
+    return httpError(res, 400, err.message || 'Failed to reprice shipment');
   }
-
-  const input = {
-    weightKg: shipment.weightKg ?? 0,
-    pieces: shipment.pieces ?? 1,
-    serviceType: shipment.serviceType || 'EXPRESS',
-    isCOD: !!shipment.isCOD,
-    codAmount: shipment.codAmount ?? 0,
-    zoneName: shipment.zoneName,
-    dimensionsCm: shipment.dimensionsCm || {},
-  };
-
-  const quote = computeTotals(input, pricing);
-  const baseAfterMin = Math.max(
-    (quote.breakdown.baseFromWeight || 0) + (quote.breakdown.baseFromPieces || 0),
-    quote.breakdown.minChargeApplied || 0
-  );
-
-  shipment.baseCharge = baseAfterMin;
-  shipment.serviceCharge = quote.breakdown.serviceAmount || 0;
-  shipment.fuelSurcharge = quote.breakdown.fuelSurcharge || 0;
-  shipment.otherFees = Math.round(((quote.breakdown.otherFixedFees || 0) + (quote.breakdown.codFee || 0)) * 100) / 100;
-  shipment.currency = quote.currency || 'AFN';
-  if (pricing.version) shipment.pricingVersion = pricing.version;
-
-  await shipment.save();
-
-  return res.json({
-    success: true,
-    data: {
-      shipment,
-      pricingVersion: pricing.version,
-      total: quote.total,
-      breakdown: quote.breakdown,
-    },
-  });
 });

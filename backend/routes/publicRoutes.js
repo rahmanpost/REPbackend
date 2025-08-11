@@ -1,15 +1,17 @@
 // backend/routes/publicRoutes.js
 import express from 'express';
-import { trackShipment } from '../controllers/publicController.js';
-import { getAllPricing, getPricingByRoute } from '../controllers/adminController.js';
+import { validate } from '../middleware/validate.js';
+import { trackingIdParamSchema } from '../validators/shipmentSchemas.js';
+import { publicTrack } from '../controllers/shipments/publicTrack.js';
+import { getQuote } from '../controllers/pricingController.js';
 
 const router = express.Router();
 
-// Public tracking by trackingId
-router.get('/:trackingId', trackShipment);
+// Public pricing quotes (active pricing only). Supports GET query or POST body.
+router.get('/pricing/quote', getQuote);
+router.post('/pricing/quote', getQuote);
 
-// Public pricing endpoints (read-only)
-router.get('/pricing', getAllPricing);
-router.get('/pricing/:fromProvince/:toProvince', getPricingByRoute);
+// Public tracking by trackingId (non-PII)
+router.get('/track/:trackingId', validate(trackingIdParamSchema, 'params'), publicTrack);
 
 export default router;

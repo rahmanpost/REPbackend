@@ -1,32 +1,59 @@
 // backend/controllers/shipments/create.js
 import asyncHandler from 'express-async-handler';
 import Shipment from '../../models/shipment.js';
-import Pricing from '../../models/pricing.js';
-import { computeTotals } from '../../utils/pricing/calc.js';
 import { generateTrackingIdWithRetry } from '../../utils/generateTrackingId.js';
 import { generateInvoiceNumber } from '../../utils/generateInvoiceNumber.js';
-import { normalizeEndpointsAF } from '../../utils/afghanistan.js';
 import { isObjectId, httpError } from './_shared.js';
 
-
-
+/**
+ * Upgraded create:
+ *  - Expects validated body with:
+ *    pickupAddress, deliveryAddress, boxType (PRESET|CUSTOM), weightKg?, volumetricDivisor?,
+ *    isCOD?, codAmount?, payment?, notes?, invoiceNumber?, trackingId?, sender? (admin only)
+ *  - No legacy fields (from/to, serviceType, items, pieces, declaredValue, zoneName)
+ *  - Pricing is NOT computed here. We set needsReprice=true and charges=0.
+ */
 export const createShipment = asyncHandler(async (req, res) => {
   const {
-    sender, invoiceNumber, agent, serviceType,
-    items, weightKg, pieces, declaredValue, notes,
-    isCOD, codAmount, zoneName, dimensionsCm,
+    // actors
+    sender,
+    // identity (optional overrides)
+    invoiceNumber,
+    trackingId,
+    // addresses
+    pickupAddress,
+    deliveryAddress,
+    // box & weight
+    boxType,
+    weightKg,
+    volumetricDivisor,
+    // pricing flags
+    isCOD,
+    codAmount,
+    // payment & misc
+    payment,
+    notes,
+    // optional currency override (defaults to AFN)
+    currency,
   } = req.body || {};
 
-  const senderId = sender || req.user?._id;
+  // Sender: admin may override, otherwise use authenticated user
+  const isAdmin = req.user?.role === 'ADMIN';
+  const senderId = isAdmin && sender ? sender : req.user?._id;
   if (!senderId || !isObjectId(senderId)) {
     return httpError(res, 400, 'Valid sender is required.');
   }
 
-  // Normalize Afghanistan-only endpoints
-  const ep = normalizeEndpointsAF(req.body);
-  if (ep.error) return httpError(res, 400, ep.error);
+  // Basic required shape should already be enforced by validator,
+  // but keep defensive checks in case a route bypassed it.
+  if (!pickupAddress || !deliveryAddress) {
+    return httpError(res, 400, 'pickupAddress and deliveryAddress are required.');
+  }
+  if (!boxType || !boxType.kind) {
+    return httpError(res, 400, 'boxType is required (PRESET or CUSTOM).');
+  }
 
-  // Invoice number (accept or generate)
+  // Invoice number (accept or generate; ensure uniqueness)
   let finalInvoiceNumber =
     typeof invoiceNumber === 'string' && invoiceNumber.trim()
       ? invoiceNumber.trim()
@@ -40,73 +67,67 @@ export const createShipment = asyncHandler(async (req, res) => {
     finalInvoiceNumber = await generateInvoiceNumber({}, isTaken);
   }
 
-  // Tracking id (collision-safe)
-  const trackingId = await generateTrackingIdWithRetry(
-    async (id) => !!(await Shipment.exists({ trackingId: id })),
-    { maxAttempts: 7 }
-  );
+  // Tracking ID (accept if unique, else generate with retry)
+  let finalTrackingId = null;
+  if (typeof trackingId === 'string' && trackingId.trim()) {
+    const id = trackingId.trim();
+    const taken = await Shipment.exists({ trackingId: id });
+    if (taken) return httpError(res, 409, 'trackingId already exists.');
+    finalTrackingId = id;
+  } else {
+    finalTrackingId = await generateTrackingIdWithRetry(
+      async (id) => !!(await Shipment.exists({ trackingId: id })),
+      { maxAttempts: 7 }
+    );
+  }
 
-  // Base doc
+  // Build the doc according to the upgraded model
   const doc = {
     sender: senderId,
-    agent: agent || null,
+
     invoiceNumber: finalInvoiceNumber,
-    trackingId,
-    serviceType: serviceType || 'EXPRESS',
-    from: ep.from,
-    to: ep.to,
-    items: Array.isArray(items) ? items : undefined,
-    weightKg: weightKg != null ? Number(weightKg) : undefined,
-    pieces: pieces != null ? Number(pieces) : undefined,
-    declaredValue: declaredValue != null ? Number(declaredValue) : undefined,
-    notes: notes || undefined,
+    trackingId: finalTrackingId,
+
+    pickupAddress,
+    deliveryAddress,
+
+    boxType,
+    weightKg: weightKg != null ? Number(weightKg) : 0,
+    volumetricDivisor: volumetricDivisor != null ? Number(volumetricDivisor) : 5000,
+
+    // charges are assigned by admin later; start at zero and mark for repricing
+    actualCharges: 0,
+    otherCharges: 0,
+    tax: 0,
+    needsReprice: true,
+
+    // COD & payment
     isCOD: !!isCOD,
     codAmount: codAmount != null ? Number(codAmount) : 0,
-    dimensionsCm: dimensionsCm || req.body?.dimensionsCm || undefined,
+    payment: {
+      mode: payment?.mode || 'DELIVERY',
+      method: payment?.method || 'CASH',
+      status: payment?.status || 'UNPAID',
+      transactionId: payment?.transactionId || undefined,
+    },
+
+    currency: currency || 'AFN',
     status: 'CREATED',
+    notes: notes || undefined,
+
+    // initial log entry
+    logs: [
+      {
+        type: 'INFO',
+        message: 'Shipment created',
+        at: new Date(),
+        by: req.user?._id,
+      },
+    ],
   };
 
-  // Pricing integration (volumetric etc.)
-  try {
-    const activePricing = await Pricing.findOne({ active: true }).lean();
-    if (activePricing) {
-      const input = {
-        weightKg: doc.weightKg ?? 0,
-        pieces: doc.pieces ?? 1,
-        serviceType: doc.serviceType,
-        isCOD: doc.isCOD,
-        codAmount: doc.codAmount ?? 0,
-        zoneName,
-        dimensionsCm: doc.dimensionsCm || {},
-      };
-      const quote = computeTotals(input, activePricing);
-
-      const baseFromWeight = quote.breakdown.baseFromWeight || 0;
-      const baseFromPieces = quote.breakdown.baseFromPieces || 0;
-      const minChargeApplied = quote.breakdown.minChargeApplied || 0;
-      const rawBase = Math.round((baseFromWeight + baseFromPieces) * 100) / 100;
-      const baseAfterMin = Math.max(rawBase, minChargeApplied);
-
-      doc.baseCharge = baseAfterMin;
-      doc.serviceCharge = quote.breakdown.serviceAmount || 0;
-      doc.fuelSurcharge = quote.breakdown.fuelSurcharge || 0;
-
-      const otherFixed = quote.breakdown.otherFixedFees || 0;
-      const codFee = quote.breakdown.codFee || 0;
-      doc.otherFees = Math.round((otherFixed + codFee) * 100) / 100;
-
-      doc.currency = quote.currency || 'AFN';
-      if (activePricing.version) doc.pricingVersion = activePricing.version;
-    }
-  } catch (_e) {
-    // ignore pricing failure
-  }
-
-  // Merge any extra fields not covered above (do not override)
-  for (const [k, v] of Object.entries(req.body || {})) {
-    if (!(k in doc)) doc[k] = v;
-  }
-
   const shipment = await Shipment.create(doc);
+  // Model pre-validate will auto-derive dimensions, volumetricWeightKg, chargeableWeightKg
+
   return res.status(201).json({ success: true, data: shipment });
 });

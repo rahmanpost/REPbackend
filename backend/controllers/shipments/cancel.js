@@ -1,39 +1,54 @@
 // backend/controllers/shipments/cancel.js
 import asyncHandler from 'express-async-handler';
 import Shipment from '../../models/shipment.js';
-import { httpError, TERMINAL_STATUSES } from './_shared.js';
+import { httpError } from './_shared.js';
 
 export const cancelShipment = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { reason } = req.body || {};
 
-  const shipment = await Shipment.findById(id);
-  if (!shipment) return httpError(res, 404, 'Shipment not found.');
+  const s = await Shipment.findById(id).select('_id sender status');
+  if (!s) return httpError(res, 404, 'Shipment not found.');
 
-  const role = String(req.user?.role || 'USER').toUpperCase();
-  const elevated = role === 'ADMIN' || role === 'AGENT';
-  const isOwner =
-    req.user &&
-    shipment.sender &&
-    String(shipment.sender) === String(req.user._id);
+  const userId = req.user?._id ? String(req.user._id) : null;
+  const isOwner = userId && s.sender && String(s.sender) === userId;
+  const isAdmin = String(req.user?.role || '').toUpperCase() === 'ADMIN';
+  if (!isOwner && !isAdmin) return httpError(res, 403, 'Forbidden');
 
-  if (!isOwner && !elevated) return httpError(res, 403, 'Forbidden');
-
-  const current = String(shipment.status || '').toUpperCase();
-  if (TERMINAL_STATUSES.has(current)) {
-    if (current === 'CANCELLED') {
-      return httpError(res, 409, 'Shipment is already cancelled.');
-    }
-    return httpError(res, 409, `Cannot cancel a ${current.toLowerCase()} shipment.`);
+  const curr = String(s.status || '').toUpperCase();
+  if (curr === 'DELIVERED' || curr === 'CANCELLED') {
+    return httpError(res, 400, `Cannot cancel when status is ${curr}`);
   }
 
-  shipment.status = 'CANCELLED';
-  shipment.cancellation = {
-    reason: reason ? String(reason) : 'Cancelled by request',
-    at: new Date(),
-    by: req.user?._id || null,
+  const now = new Date();
+  const cancelObj = {
+    reason: reason || 'Cancelled',
+    at: now,
+    by: req.user?._id,
   };
 
-  await shipment.save();
-  res.json({ success: true, data: shipment });
+  // 🔒 Atomic write; skip full validation to support legacy records
+  await Shipment.updateOne(
+    { _id: s._id },
+    {
+      $set: {
+        status: 'CANCELLED',
+        cancellation: cancelObj,
+      },
+      $push: {
+        logs: {
+          type: 'STATUS',
+          message: `Status changed ${curr} -> CANCELLED${reason ? ` (${reason})` : ''}`,
+          at: now,
+          by: req.user?._id,
+        },
+      },
+    },
+    { runValidators: false }
+  );
+
+  return res.json({
+    success: true,
+    data: { status: 'CANCELLED', cancellation: cancelObj },
+  });
 });

@@ -25,6 +25,8 @@ import publicRoutes from './routes/publicRoutes.js';
 import pricingRoutes from './routes/pricingRoutes.js';
 import uploadRoutes from './routes/uploadRoutes.js';
 
+
+
 // __dirname in ESM
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -92,9 +94,11 @@ app.use('/api/invoice', invoiceRoutes);
 app.use('/api/public', publicRoutes);      // /api/public/track/:trackingId + /api/public/pricing/quote
 app.use('/api/pricing', pricingRoutes);    // admin/user pricing routes you already have
 app.use('/api/upload', uploadRoutes);
+app.use('/api/admin/pricing', pricingRoutes);
 
 // Static files (uploads)
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/uploads', express.static(path.join(process.cwd(), 'backend', 'uploads')));
 
 // 404 + error handler
 app.use(notFound);

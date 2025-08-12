@@ -19,9 +19,7 @@ function extractToken(req) {
   return null;
 }
 
-/**
- * Verify JWT and return payload or null.
- */
+/** Verify JWT and return payload or null. */
 function verifyJwt(token) {
   try {
     return jwt.verify(token, process.env.JWT_SECRET);
@@ -31,7 +29,7 @@ function verifyJwt(token) {
 }
 
 /**
- * Attach req.user if token is valid (does not error if missing/invalid).
+ * Attach req.user if token is present & valid (no error if missing/invalid).
  * Useful for public endpoints that behave differently when signed in.
  */
 export const attachUserIfPresent = asyncHandler(async (req, _res, next) => {
@@ -41,16 +39,13 @@ export const attachUserIfPresent = asyncHandler(async (req, _res, next) => {
   const decoded = verifyJwt(token);
   if (!decoded?.id) return next();
 
-  // Pull minimal fields; add more if you commonly need them
-  const user = await User.findById(decoded.id).select('_id name email role');
+  const user = await User.findById(decoded.id).select('_id fullName email role emailVerified');
   if (user) req.user = user;
 
   next();
 });
 
-/**
- * Require a valid token. Sets req.user.
- */
+/** Require a valid token. Sets req.user from DB. */
 export const protect = asyncHandler(async (req, res, next) => {
   const token = extractToken(req);
   if (!token) {
@@ -62,35 +57,39 @@ export const protect = asyncHandler(async (req, res, next) => {
     return res.status(401).json({ success: false, message: 'Not authorized: token invalid or expired' });
   }
 
-  const user = await User.findById(decoded.id).select('_id name email role');
+  const user = await User.findById(decoded.id).select('_id fullName email role emailVerified');
   if (!user) {
     return res.status(401).json({ success: false, message: 'Not authorized: user not found' });
   }
 
-  req.user = user;
+  req.user = user; // trust DB role (handles promotions without reissuing JWT)
   next();
 });
 
-/**
- * Role guards
- */
-export const isAdmin = (req, res, next) => {
-  if (req.user?.role === 'ADMIN') return next();
+/** Flexible role guard. Usage: requireRoles('admin','agent') */
+export const requireRoles = (...roles) => {
+  const allow = (Array.isArray(roles[0]) ? roles[0] : roles).map((r) => String(r).toLowerCase());
+  const allowSet = new Set(allow);
+  return (req, res, next) => {
+    const role = String(req.user?.role || '').toLowerCase();
+    if (allowSet.has(role)) return next();
+    return res.status(403).json({ success: false, message: `Forbidden: requires ${[...allowSet].join(' or ')}` });
+  };
+};
+
+/** Convenience gates */
+export const requireAdmin = (req, res, next) => {
+  const role = String(req.user?.role || '').toLowerCase();
+  if (role === 'admin') return next();
   return res.status(403).json({ success: false, message: 'Forbidden: admin only' });
 };
 
-export const isAgent = (req, res, next) => {
-  const role = req.user?.role;
-  if (role === 'AGENT' || role === 'ADMIN') return next();
+export const requireAgent = (req, res, next) => {
+  const role = String(req.user?.role || '').toLowerCase();
+  if (role === 'agent' || role === 'admin') return next();
   return res.status(403).json({ success: false, message: 'Forbidden: agent only' });
 };
 
-/**
- * Flexible role guard.
- * Usage: router.post('/x', protect, requireRoles('ADMIN','AGENT'), handler)
- */
-export const requireRoles = (...roles) => (req, res, next) => {
-  const role = req.user?.role;
-  if (role && roles.includes(role)) return next();
-  return res.status(403).json({ success: false, message: `Forbidden: requires ${roles.join(' or ')}` });
-};
+// Legacy aliases so older routes don't break
+export const isAdmin = requireAdmin;
+export const isAgent = requireAgent;

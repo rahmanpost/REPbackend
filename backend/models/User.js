@@ -60,6 +60,21 @@ const userSchema = new mongoose.Schema(
     // Only present for agents
     agentProfile: { type: agentProfileSchema, default: undefined },
 
+    // Email verification flow
+    emailVerified: { type: Boolean, default: false },
+    emailVerifyToken: { type: String },    // sha256(token)
+    emailVerifyExpires: { type: Date },
+
+    // Login backoff/lockout
+    loginAttempts: { type: Number, default: 0 },
+    lockUntil: { type: Date, default: null },
+
+    // Password reset state (set by forgot-password, cleared after reset)
+    passwordReset: {
+      tokenHash: { type: String }, // sha256(token)
+      expiresAt: { type: Date },   // expiry timestamp
+    },
+
     isBlocked: { type: Boolean, default: false },
     lastLoginAt: { type: Date },
     profilePicture: { type: String, trim: true },
@@ -70,6 +85,9 @@ const userSchema = new mongoose.Schema(
     toJSON: {
       transform(_doc, ret) {
         delete ret.password;
+        delete ret.passwordReset;     // never expose reset state
+        delete ret.emailVerifyToken;  // never expose verify token
+        delete ret.emailVerifyExpires;
         return ret;
       },
     },
@@ -79,7 +97,6 @@ const userSchema = new mongoose.Schema(
 /**
  * Indexes
  *  - Partial unique on phone => enforces uniqueness only for non-empty strings
- *    (Allowed operators for partial filters: $exists, $eq, $gt/$gte/$lt/$lte, $type, $and/$or)
  */
 userSchema.index(
   { phone: 1 },

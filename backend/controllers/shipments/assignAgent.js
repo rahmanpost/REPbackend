@@ -1,80 +1,93 @@
+// backend/controllers/shipments/assignAgent.js
 import asyncHandler from 'express-async-handler';
-import mongoose from 'mongoose';
 import Shipment from '../../models/shipment.js';
 import User from '../../models/User.js';
+import { isObjectId, httpError } from './_shared.js';
 
-const httpError = (res, code, message) =>
-  res.status(code).json({ success: false, message });
+const TERMINAL = new Set(['DELIVERED', 'CANCELLED']);
 
-const TERMINAL_STATUSES = new Set(['DELIVERED', 'CANCELLED']); // upgraded lifecycle
+function normStage(s) {
+  const v = String(s || '').toUpperCase().trim();
+  if (v === 'PICKUP' || v === 'DELIVERY') return v;
+  return null;
+}
 
 /**
  * PATCH /api/shipments/:id/assign-agent
- * Body: { stage: 'PICKUP' | 'DELIVERY', agentId: string }
- * Roles: ADMIN or AGENT (coordinator). Customers cannot assign.
+ * Body: { stage: 'PICKUP' | 'DELIVERY', agentId: string, replace?: boolean, bumpInvoice?: boolean }
+ * Roles: admin/agent via route guards (customers should not hit this).
  */
 export const assignAgent = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  let { stage, agentId } = req.body || {};
+  let { stage, agentId, replace = false, bumpInvoice = false } = req.body || {};
 
-  if (!mongoose.Types.ObjectId.isValid(id)) {
-    return httpError(res, 400, 'Invalid shipment id.');
-  }
-  if (!agentId || !mongoose.Types.ObjectId.isValid(agentId)) {
-    return httpError(res, 400, 'agentId is required and must be a valid id.');
-  }
+  // Basic validations
+  if (!isObjectId(id)) return httpError(res, 400, 'Invalid shipment id.');
+  stage = normStage(stage);
+  if (!stage) return httpError(res, 400, 'stage must be PICKUP or DELIVERY.');
+  if (!isObjectId(agentId)) return httpError(res, 400, 'Invalid agentId.');
 
-  // Only Admins/Agents can assign
-  const role = String(req.user?.role || '').toUpperCase();
-  const elevated = role === 'ADMIN' || role === 'AGENT';
-  if (!elevated) return httpError(res, 403, 'Forbidden');
-
-  // Normalize/validate stage
-  stage = String(stage || 'PICKUP').trim().toUpperCase();
-  if (stage !== 'PICKUP' && stage !== 'DELIVERY') {
-    return httpError(res, 400, 'stage must be PICKUP or DELIVERY.');
-  }
-
+  // Load shipment
   const shipment = await Shipment.findById(id);
   if (!shipment) return httpError(res, 404, 'Shipment not found.');
 
-  const status = String(shipment.status || '').toUpperCase();
-  if (TERMINAL_STATUSES.has(status)) {
-    return httpError(res, 409, `Cannot assign agent to a ${status.toLowerCase()} shipment.`);
+  // Block on terminal statuses
+  if (TERMINAL.has(shipment.status)) {
+    return httpError(res, 409, `Cannot assign agent on terminal shipment (${shipment.status}).`);
   }
 
-  // Verify target is a User with role AGENT (accept both 'agent' and 'AGENT')
-  const agentUser = await User.findOne({ _id: agentId, role: { $in: ['agent', 'AGENT'] } });
-  if (!agentUser) return httpError(res, 404, 'Agent user not found or not an AGENT.');
+  // Verify agent exists and has agent role (stored lowercase in DB)
+  const agent = await User.findById(agentId).select('_id fullName role').lean();
+  if (!agent) return httpError(res, 404, 'Agent user not found.');
 
-  const now = new Date();
-  const setField =
-    stage === 'PICKUP'
-      ? { pickupAgent: agentUser._id }
-      : { deliveryAgent: agentUser._id };
+  const role = String(agent.role || '').toLowerCase();
+  if (role !== 'agent') {
+    return httpError(res, 400, 'Selected user is not an agent.');
+  }
 
-  // 🔒 Atomic update — skip full validation to avoid legacy required-field issues
-  await Shipment.updateOne(
-    { _id: shipment._id },
-    {
-      $set: setField,
-      $push: {
-        logs: {
-          type: 'INFO',
-          message: `Assigned ${stage.toLowerCase()} agent: ${agentUser._id}`,
-          at: now,
-          by: req.user?._id,
-        },
-      },
-    },
-    { runValidators: false }
-  );
+  // Determine field to set
+  const field = stage === 'PICKUP' ? 'pickupAgent' : 'deliveryAgent';
+  const prev = shipment[field]?.toString?.() || null;
+  const next = agentId.toString();
 
-  // Return a populated snapshot
-  const populated = await Shipment.findById(shipment._id)
-    .populate('sender', 'fullName email')
-    .populate('pickupAgent', 'fullName email')
-    .populate('deliveryAgent', 'fullName email');
+  // If same agent already assigned and not replacing, conflict
+  if (prev && prev === next && !replace) {
+    return httpError(res, 409, `This ${stage.toLowerCase()} agent is already assigned.`);
+  }
 
-  return res.json({ success: true, data: populated });
+  // If different agent already assigned and replace not requested, block
+  if (prev && prev !== next && !replace) {
+    return httpError(
+      res,
+      409,
+      `A different ${stage.toLowerCase()} agent is already assigned. Pass replace: true to reassign.`
+    );
+  }
+
+  // Assign (or reassign)
+  shipment[field] = agentId;
+
+  // Optional: bump invoice version if requested (useful if invoice shows assigned agent)
+  if (bumpInvoice) {
+    shipment.invoiceVersion = (shipment.invoiceVersion || 0) + 1;
+    shipment.invoiceRegeneratedAt = new Date();
+  }
+
+  // Log action
+  shipment.logs = shipment.logs || [];
+  shipment.logs.push({
+    type: 'ASSIGN',
+    message:
+      prev && prev !== next
+        ? `Reassigned ${stage} agent: ${prev} → ${next}`
+        : `Assigned ${stage} agent: ${next}`,
+    at: new Date(),
+    by: req.user?._id,
+  });
+
+  await shipment.save();
+
+  return res.json({ success: true, data: shipment });
 });
+
+export default assignAgent;

@@ -7,6 +7,8 @@
     "start": "node backend/server.js",
     "dev": "env-cmd -f ./backend/.env nodemon backend/server.js",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --detectOpenHandles --forceExit"
+    ,"reprice": "node backend/scripts/bulkReprice.js",
+     "reprice:apply": "node backend/scripts/bulkReprice.js --apply"
   },
   "keywords": [],
   "author": "",

@@ -11,6 +11,7 @@
  *  - #8: 40 × 44 × 54 → 20.5 kg
  */
 export const BOX_PRESETS = {
+  2: { code: 2, lengthCm: 34, widthCm: 20, heightCm: 10, maxWeightKg: 2.0 },
   3: { code: 3, lengthCm: 34, widthCm: 33, heightCm: 16, maxWeightKg: 3.5 },
   4: { code: 4, lengthCm: 32, widthCm: 33, heightCm: 18, maxWeightKg: 4.0 },
   5: { code: 5, lengthCm: 34, widthCm: 34, heightCm: 32, maxWeightKg: 8.0 },

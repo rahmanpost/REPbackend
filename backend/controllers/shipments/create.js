@@ -1,17 +1,19 @@
 // backend/controllers/shipments/create.js
 import asyncHandler from 'express-async-handler';
 import Shipment from '../../models/shipment.js';
+import Pricing from '../../models/pricing.js';
 import { generateTrackingIdWithRetry } from '../../utils/generateTrackingId.js';
 import { generateInvoiceNumber } from '../../utils/generateInvoiceNumber.js';
+import computeTotals from '../../utils/computeTotals.js';
 import { isObjectId, httpError } from './_shared.js';
 
+const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
 /**
- * Upgraded create:
- *  - Expects validated body with:
- *    pickupAddress, deliveryAddress, boxType (PRESET|CUSTOM), weightKg?, volumetricDivisor?,
- *    isCOD?, codAmount?, payment?, notes?, invoiceNumber?, trackingId?, sender? (admin only)
- *  - No legacy fields (from/to, serviceType, items, pieces, declaredValue, zoneName)
- *  - Pricing is NOT computed here. We set needsReprice=true and charges=0.
+ * Hybrid create:
+ *  - Preserves your current structure/fields.
+ *  - If an active Pricing exists: compute totals immediately.
+ *  - If not: keep charges at 0 and set needsReprice = true (your current flow).
  */
 export const createShipment = asyncHandler(async (req, res) => {
   const {
@@ -33,19 +35,20 @@ export const createShipment = asyncHandler(async (req, res) => {
     // payment & misc
     payment,
     notes,
-    // optional currency override (defaults to AFN)
+    // currency (defaults to AFN)
     currency,
+    // optional other charges array [{label, amount}]
+    otherCharges,
   } = req.body || {};
 
   // Sender: admin may override, otherwise use authenticated user
-  const isAdmin = req.user?.role === 'ADMIN';
+  const isAdmin = String(req.user?.role || '').toUpperCase() === 'ADMIN';
   const senderId = isAdmin && sender ? sender : req.user?._id;
   if (!senderId || !isObjectId(senderId)) {
     return httpError(res, 400, 'Valid sender is required.');
   }
 
-  // Basic required shape should already be enforced by validator,
-  // but keep defensive checks in case a route bypassed it.
+  // Defensive checks (validators should enforce these too)
   if (!pickupAddress || !deliveryAddress) {
     return httpError(res, 400, 'pickupAddress and deliveryAddress are required.');
   }
@@ -53,7 +56,7 @@ export const createShipment = asyncHandler(async (req, res) => {
     return httpError(res, 400, 'boxType is required (PRESET or CUSTOM).');
   }
 
-  // Invoice number (accept or generate; ensure uniqueness)
+  // Invoice number: accept or generate (ensure uniqueness)
   let finalInvoiceNumber =
     typeof invoiceNumber === 'string' && invoiceNumber.trim()
       ? invoiceNumber.trim()
@@ -67,7 +70,7 @@ export const createShipment = asyncHandler(async (req, res) => {
     finalInvoiceNumber = await generateInvoiceNumber({}, isTaken);
   }
 
-  // Tracking ID (accept if unique, else generate with retry)
+  // Tracking ID: accept unique or generate with retry
   let finalTrackingId = null;
   if (typeof trackingId === 'string' && trackingId.trim()) {
     const id = trackingId.trim();
@@ -81,7 +84,55 @@ export const createShipment = asyncHandler(async (req, res) => {
     );
   }
 
-  // Build the doc according to the upgraded model
+  // Defaults
+  const vDivisor = volumetricDivisor != null ? Number(volumetricDivisor) : 5000;
+  const weight = weightKg != null ? Number(weightKg) : 0;
+
+  // Load active pricing (your schema uses `active` + `archived`)
+  const activePricingDoc = await Pricing
+    .findOne({ active: true, archived: false })
+    .sort({ updatedAt: -1 })
+    .lean()
+    .exec();
+
+  // Map Pricing -> computeTotals input (aligned to your model)
+  const pricing = activePricingDoc
+    ? {
+        pricingVersion: activePricingDoc.name,          // for breakdown only
+        volumetricDivisor: activePricingDoc.volumetricDivisor ?? vDivisor,
+        mode: activePricingDoc.mode || 'WEIGHT',        // 'WEIGHT' | 'VOLUME'
+        perKg: activePricingDoc.perKg,                  // weight mode
+        baseFee: activePricingDoc.baseFee || 0,
+        minCharge: activePricingDoc.minCharge || 0,
+        pricePerCubicCm: activePricingDoc.pricePerCubicCm || null,      // volume mode
+        pricePerCubicMeter: activePricingDoc.pricePerCubicMeter || null,
+        taxPercent: activePricingDoc.taxPercent ?? 0,
+
+        // Extras not in your model → default harmlessly:
+        fuelPct: 0,
+        remoteAreaFee: 0,
+        remoteProvinces: [],
+        otherCharges: [],
+      }
+    : null;
+
+  // Build computeTotals shipment-like payload
+  const shipmentLike = {
+    boxType,
+    weightKg: weight,
+    volumetricDivisor: vDivisor,
+    pickupAddress,
+    deliveryAddress,
+    otherCharges: Array.isArray(otherCharges) ? otherCharges : [],
+  };
+
+  // Compute totals if pricing exists; otherwise keep zeros and mark needsReprice
+  let totals = null;
+  if (pricing) {
+    totals = computeTotals(shipmentLike, pricing);
+  }
+
+  // Build the doc according to your upgraded model
   const doc = {
     sender: senderId,
 
@@ -92,14 +143,23 @@ export const createShipment = asyncHandler(async (req, res) => {
     deliveryAddress,
 
     boxType,
-    weightKg: weightKg != null ? Number(weightKg) : 0,
-    volumetricDivisor: volumetricDivisor != null ? Number(volumetricDivisor) : 5000,
+    weightKg: weight,
+    volumetricDivisor: vDivisor,
 
-    // charges are assigned by admin later; start at zero and mark for repricing
-    actualCharges: 0,
-    otherCharges: 0,
-    tax: 0,
-    needsReprice: true,
+    // Charges: compute if possible, else zeros
+    actualCharges: totals ? totals.actualCharges : 0,
+    otherCharges: totals
+      ? r2(
+          (totals.surcharges?.fuel || 0) +
+          (totals.surcharges?.remote || 0) +
+          (totals.surcharges?.other || 0)
+        )
+      : 0,
+    tax: totals ? totals.tax : 0,
+    needsReprice: !totals,
+
+    // Store ObjectId ref to Pricing (fixes cast error)
+    pricingVersion: activePricingDoc?._id,
 
     // COD & payment
     isCOD: !!isCOD,
@@ -119,7 +179,7 @@ export const createShipment = asyncHandler(async (req, res) => {
     logs: [
       {
         type: 'INFO',
-        message: 'Shipment created',
+        message: totals ? 'Shipment created (auto-priced)' : 'Shipment created (awaiting reprice)',
         at: new Date(),
         by: req.user?._id,
       },
@@ -127,7 +187,22 @@ export const createShipment = asyncHandler(async (req, res) => {
   };
 
   const shipment = await Shipment.create(doc);
-  // Model pre-validate will auto-derive dimensions, volumetricWeightKg, chargeableWeightKg
+  // Model pre-validate should auto-derive dimensions, volumetricWeightKg, chargeableWeightKg
 
-  return res.status(201).json({ success: true, data: shipment });
+  return res.status(201).json({
+    success: true,
+    data: {
+      ...shipment.toObject(),
+      pricingLabel: activePricingDoc?.name || null, // human-readable tag (optional)
+      ...(totals
+        ? {
+            breakdown: totals.breakdown,
+            surcharges: totals.surcharges,
+            grandTotal: totals.grandTotal,
+          }
+        : {}),
+    },
+  });
 });
+
+export default createShipment;

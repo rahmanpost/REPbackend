@@ -32,15 +32,17 @@ const locationPointSchema = new Schema(
   { _id: false }
 );
 
-/** Log entries for status/location/info */
+/** Log entries for status/location/info (FORCED UPPERCASE) */
 const logSchema = new Schema(
   {
     at: { type: Date, default: Date.now },
     by: { type: Schema.Types.ObjectId, ref: 'User' },
     type: {
       type: String,
-      enum: ['INFO', 'WARN', 'ERROR', 'STATUS', 'LOCATION'],
+      enum: ['INFO', 'WARN', 'ERROR', 'STATUS', 'LOCATION', 'ASSIGN'],
       default: 'INFO',
+      uppercase: true, // ensure any value saved is uppercased
+      trim: true,
     },
     message: { type: String, trim: true },
     data: {},

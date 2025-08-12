@@ -5,11 +5,14 @@ import asyncHandler from 'express-async-handler';
 import User from '../models/User.js';
 import { sendVerificationEmail, sendPasswordResetEmail } from '../utils/mailer.js';
 
-
 // in authController.js (top)
-async function safeEmail(promise, label='email'){
-  try { return await promise; } 
-  catch(e){ console.error(`[mailer] ${label} failed:`, e?.response || e?.message || e); return null; }
+async function safeEmail(promise, label = 'email') {
+  try {
+    return await promise;
+  } catch (e) {
+    console.error(`[mailer] ${label} failed:`, e?.response || e?.message || e);
+    return null;
+  }
 }
 
 /** ------------------------
@@ -19,6 +22,8 @@ const {
   JWT_SECRET,
   JWT_EXPIRE = '7d',
   EMAIL_VERIFICATION_REQUIRED = 'true', // set to 'false' to skip email verify gating on login
+  APP_ORIGIN, // optional: frontend origin for reset link
+  API_ORIGIN, // optional: fallback origin
 } = process.env;
 
 function signToken(user) {
@@ -29,6 +34,16 @@ function buildAbsoluteUrl(req, relativePathWithQuery) {
   const proto = (req.get('x-forwarded-proto') || req.protocol || 'http').split(',')[0].trim();
   const host = (req.get('x-forwarded-host') || req.get('host')).split(',')[0].trim();
   return `${proto}://${host}${relativePathWithQuery}`;
+}
+
+// Prefer APP_ORIGIN (frontend), else API_ORIGIN, else current request’s origin
+function buildResetUrl(req, email, token) {
+  const origin =
+    (APP_ORIGIN || API_ORIGIN || buildAbsoluteUrl(req, '')).replace(/\/$/, '');
+  // If you have a SPA route, e.g. /reset-password, it will pick up token/email from query
+  return `${origin}/reset-password?token=${encodeURIComponent(token)}&email=${encodeURIComponent(
+    email
+  )}`;
 }
 
 // Progressive backoff config
@@ -74,7 +89,7 @@ export const register = asyncHandler(async (req, res) => {
     return res.status(400).json({ success: false, message: 'fullName/name, phone, email, and password are required' });
   }
 
-  const existing = await User.findOne({ email: email.toLowerCase() });
+  const existing = await User.findOne({ email: String(email).toLowerCase() });
   if (existing) {
     return res.status(409).json({ success: false, message: 'Email already registered' });
   }
@@ -82,7 +97,7 @@ export const register = asyncHandler(async (req, res) => {
   const user = await User.create({
     fullName: fullName || name,      // ← map name → fullName
     phone,                            // ← required by your model
-    email: email.toLowerCase(),
+    email: String(email).toLowerCase(),
     password,                         // assume pre-save hook hashes
     emailVerified: false,
     loginAttempts: 0,
@@ -97,7 +112,6 @@ export const register = asyncHandler(async (req, res) => {
 
     const verifyUrl = buildAbsoluteUrl(req, `/api/auth/verify-email?token=${encodeURIComponent(raw)}`);
     await safeEmail(sendVerificationEmail({ to: user.email, verifyUrl }), 'verification');
-
   }
 
   const token = signToken(user);
@@ -118,7 +132,6 @@ export const register = asyncHandler(async (req, res) => {
   });
 });
 
-
 /**
  * @route  POST /api/auth/login
  * @access Public
@@ -129,7 +142,7 @@ export const login = asyncHandler(async (req, res) => {
     return res.status(400).json({ success: false, message: 'Email and password are required' });
   }
 
-  const user = await User.findOne({ email: email.toLowerCase() }).select('+password +loginAttempts +lockUntil');
+  const user = await User.findOne({ email: String(email).toLowerCase() }).select('+password +loginAttempts +lockUntil');
   if (!user) {
     return res.status(401).json({ success: false, message: 'Invalid credentials' });
   }
@@ -157,14 +170,14 @@ export const login = asyncHandler(async (req, res) => {
 
   // Require verified email if configured
   if (EMAIL_VERIFICATION_REQUIRED === 'true' && !user.emailVerified) {
-    // Keep the UX smooth: if no token or expired, refresh a new one automatically
+    // If no token or expired, refresh a new one automatically
     const needNew = !user.emailVerifyToken || !user.emailVerifyExpires || user.emailVerifyExpires < new Date();
     if (needNew) {
       const { raw, hashed, expires } = genTokenPair(60 * 24);
       user.emailVerifyToken = hashed;
       user.emailVerifyExpires = expires;
       const verifyUrl = buildAbsoluteUrl(req, `/api/auth/verify-email?token=${encodeURIComponent(raw)}`);
-      await sendVerificationEmail({ to: user.email, verifyUrl });
+      await safeEmail(sendVerificationEmail({ to: user.email, verifyUrl }), 'verification');
     }
     await user.save({ validateBeforeSave: false });
     return res.status(403).json({ success: false, message: 'Email not verified. Verification link sent to your email.' });
@@ -191,24 +204,38 @@ export const login = asyncHandler(async (req, res) => {
 /**
  * @route  POST /api/auth/forgot-password
  * @access Public
+ * @body   { email }
  */
 export const forgotPassword = asyncHandler(async (req, res) => {
-  const { email } = req.body || {};
+  const emailRaw = req.body?.email;
+  const email = typeof emailRaw === 'string' ? emailRaw.trim().toLowerCase() : '';
   if (!email) return res.status(400).json({ success: false, message: 'Email is required' });
 
-  const user = await User.findOne({ email: email.toLowerCase() });
+  const user = await User.findOne({ email });
+  // Do not reveal whether an account exists
   if (!user) {
-    // Do not reveal whether an account exists
     return res.json({ success: true, message: 'If that email exists, a reset link has been sent.' });
   }
 
+  // Throttle: if a valid token already exists, don’t spam
+  if (user.passwordReset?.expiresAt && user.passwordReset.expiresAt > new Date()) {
+    return res.json({ success: true, message: 'A reset link was recently sent. Please check your inbox.' });
+  }
+
   const { raw, hashed, expires } = genTokenPair(60); // 60 minutes
-  user.resetPasswordToken = hashed;
-  user.resetPasswordExpires = expires;
+  user.passwordReset = { tokenHash: hashed, expiresAt: expires };
   await user.save({ validateBeforeSave: false });
 
-  const resetUrl = buildAbsoluteUrl(req, `/api/auth/reset-password?token=${encodeURIComponent(raw)}`);
-  await sendPasswordResetEmail({ to: user.email, resetUrl });
+  // Build link for your frontend
+  const resetUrl = buildResetUrl(req, email, raw);
+
+  const sent = await safeEmail(sendPasswordResetEmail({ to: user.email, resetUrl }), 'password reset');
+  if (!sent) {
+    // If sending fails, clear token so user can retry soon
+    user.passwordReset = undefined;
+    await user.save({ validateBeforeSave: false });
+    return res.status(500).json({ success: false, message: 'Failed to send email, please try again later.' });
+  }
 
   res.json({ success: true, message: 'If that email exists, a reset link has been sent.' });
 });
@@ -217,29 +244,32 @@ export const forgotPassword = asyncHandler(async (req, res) => {
  * @route  POST /api/auth/reset-password
  * @access Public
  * @body   { token, password }
+ *
+ * NOTE: Your validator currently expects { token, password } (no email).
+ * We look up by hashed token only, using the passwordReset subdoc.
  */
 export const resetPassword = asyncHandler(async (req, res) => {
   const { token, password } = req.body || {};
   if (!token || !password) {
     return res.status(400).json({ success: false, message: 'Token and new password are required' });
   }
+  if (String(password).length < 8) {
+    return res.status(400).json({ success: false, message: 'new password must be at least 8 characters' });
+  }
 
   const hashed = hashToken(token);
   const user = await User.findOne({
-    resetPasswordToken: hashed,
-    resetPasswordExpires: { $gt: new Date() },
+    'passwordReset.tokenHash': hashed,
+    'passwordReset.expiresAt': { $gt: new Date() },
   }).select('+password');
 
   if (!user) {
     return res.status(400).json({ success: false, message: 'Reset token is invalid or has expired' });
   }
 
-  user.password = password; // assume pre-save hook hashes
-  user.resetPasswordToken = undefined;
-  user.resetPasswordExpires = undefined;
-
-  // Also clear login lock if any
-  user.loginAttempts = 0;
+  user.password = String(password);         // pre-save hook will hash
+  user.passwordReset = undefined;           // clear reset state
+  user.loginAttempts = 0;                   // clear lock state (if present in schema)
   user.lockUntil = null;
 
   await user.save();
@@ -293,7 +323,7 @@ export const resendVerification = asyncHandler(async (req, res) => {
   await user.save({ validateBeforeSave: false });
 
   const verifyUrl = buildAbsoluteUrl(req, `/api/auth/verify-email?token=${encodeURIComponent(raw)}`);
-  await sendVerificationEmail({ to: user.email, verifyUrl });
+  await safeEmail(sendVerificationEmail({ to: user.email, verifyUrl }), 'verification');
 
   res.json({ success: true, message: 'Verification link sent' });
 });

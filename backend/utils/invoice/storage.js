@@ -63,3 +63,9 @@ export function toRelativeUploads(absPath) {
   const rel = path.relative(normRoot, normAbs).split(path.sep).join('/');
   return `/uploads/${rel}`;
 }
+
+// backend/utils/invoice/storage.js (add)
+export function removeInvoice(shipment) {
+  const abs = invoiceExists(shipment);
+  if (abs && fs.existsSync(abs)) try { fs.unlinkSync(abs); } catch {}
+}

@@ -1,15 +1,23 @@
+// backend/routes/invoiceRoutes.js
 import express from 'express';
 import fs from 'fs';
+
 import Shipment from '../models/shipment.js';
 import { protect } from '../middleware/authMiddleware.js';
+
+// Invoice generator (supports default or named exports)
 import * as invoicePDFMod from '../utils/invoice/generateInvoicePDF.js';
+
+// Shared enrichment (maps your shipment fields to invoice-friendly aliases)
+import { enrichForInvoice } from '../utils/invoice/enrich.js';
+
+// Local storage helpers for caching the generated PDF
 import {
   invoiceExists,
   saveInvoiceBuffer,
   toRelativeUploads,
   makeInvoiceFilename,
 } from '../utils/invoice/storage.js';
-import { enrichForInvoice } from '../utils/invoice/enrich.js';
 
 const router = express.Router();
 
@@ -27,10 +35,16 @@ const canView = (user, shipment) => {
 
 /**
  * GET /api/invoice/:id/pdf
- * - Serve cached invoice if present
- * - Otherwise enrich → generate → save → update attachments → return
+ * Query:
+ *   - layout=a4|thermal  (default a4)
+ *   - download=1         (force download; otherwise inline)
+ *
+ * Behavior:
+ *   - Serve cached PDF if available.
+ *   - Otherwise generate → cache → update shipment.attachments → return.
  */
 router.get('/:id/pdf', protect, async (req, res) => {
+  const { layout, download } = req.query || {};
   try {
     const sh = await Shipment.findById(req.params.id);
     if (!sh) return res.status(404).json({ success: false, message: 'Shipment not found' });
@@ -39,16 +53,21 @@ router.get('/:id/pdf', protect, async (req, res) => {
     // 1) Serve cached file if present
     const cachedAbs = invoiceExists(sh);
     if (cachedAbs) {
+      const filename = makeInvoiceFilename(sh);
       res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="${makeInvoiceFilename(sh)}"`);
+      const disp = String(download) === '1' ? 'attachment' : 'inline';
+      res.setHeader('Content-Disposition', `${disp}; filename="${filename}"`);
       return res.sendFile(cachedAbs);
     }
 
     // 2) Generate and save
-    if (!genInvoice) return res.status(500).json({ success: false, message: 'Invoice generator not available' });
+    if (!genInvoice) {
+      return res.status(500).json({ success: false, message: 'Invoice generator not available' });
+    }
 
     const { plain, meta } = enrichForInvoice(sh);
-    let out = await genInvoice(plain, { asBuffer: true, invoiceData: meta });
+
+    let out = await genInvoice(plain, { asBuffer: true, invoiceData: meta, layout });
 
     let buf =
       Buffer.isBuffer(out) ? out :
@@ -66,7 +85,9 @@ router.get('/:id/pdf', protect, async (req, res) => {
         (out?.path ? fs.readFileSync(out.path) : null));
     }
 
-    if (!buf) return res.status(500).json({ success: false, message: 'Could not generate invoice PDF' });
+    if (!buf) {
+      return res.status(500).json({ success: false, message: 'Could not generate invoice PDF' });
+    }
 
     const savedAbs = saveInvoiceBuffer(sh, buf);
 
@@ -84,7 +105,8 @@ router.get('/:id/pdf', protect, async (req, res) => {
     await sh.save();
 
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${makeInvoiceFilename(sh)}"`);
+    const disp2 = String(download) === '1' ? 'attachment' : 'inline';
+    res.setHeader('Content-Disposition', `${disp2}; filename="${makeInvoiceFilename(sh)}"`);
     return res.send(buf);
   } catch (e) {
     return res.status(500).json({ success: false, message: e?.message || 'Failed to generate invoice' });

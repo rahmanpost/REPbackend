@@ -1,6 +1,5 @@
 // backend/routes/shipmentRoutes.js
 import express from 'express';
-import { z } from 'zod';
 import {
   createShipment,
   updateShipmentStatus,
@@ -9,7 +8,6 @@ import {
   getMyShipments,
   cancelShipment,
   updateShipmentLocation,
-  uploadShipmentFiles,
   previewRepriceShipment,
   repriceShipment,
 } from '../controllers/shipments/index.js';
@@ -23,6 +21,8 @@ import {
   listShipmentsQuery,
   adminRepriceSchema,
 } from '../validators/shipmentSchemas.js';
+import { uploadShipmentFiles } from '../controllers/shipments/uploadFiles.js';
+import { shipmentFilesFields } from '../middleware/uploadMiddleware.js';
 
 const router = express.Router();
 
@@ -30,21 +30,15 @@ const router = express.Router();
 const validate = (schema) => (req, res, next) => {
   if (!schema) return next();
 
-  // For GET validate query only; for others validate merged body+params
-  const input = req.method === 'GET'
-    ? req.query
-    : { ...req.body, ...req.params };
-
+  const input = req.method === 'GET' ? req.query : { ...req.body, ...req.params };
   const parsed = schema.safeParse(input);
 
   if (parsed.success) {
     if (req.method === 'GET') {
-      // Express v5: mutate req.query in place (no reassignment)
       const q = parsed.data || {};
       for (const k of Object.keys(req.query)) delete req.query[k];
       Object.assign(req.query, q);
     } else {
-      // For body, assignment is fine; params stay as-is
       req.body = parsed.data;
     }
     return next();
@@ -61,14 +55,14 @@ const validate = (schema) => (req, res, next) => {
   });
 };
 
-/** Role gate: AGENT or ADMIN only (DB stores roles lowercase) */
+/** Role gate: AGENT or ADMIN only */
 const requireAgentOrAdmin = (req, res, next) => {
   const role = String(req.user?.role || '').toLowerCase();
   if (role === 'admin' || role === 'agent') return next();
   return res.status(403).json({ success: false, message: 'Forbidden' });
 };
 
-/** Map :id param to pushLocationBody.shipmentId so we can reuse the validator */
+/** Map :id → body.shipmentId for location validator reuse */
 const mapParamIdToShipmentId = (req, _res, next) => {
   if (req.params?.id && !req.body?.shipmentId) {
     req.body = { ...(req.body || {}), shipmentId: req.params.id };
@@ -76,94 +70,31 @@ const mapParamIdToShipmentId = (req, _res, next) => {
   next();
 };
 
-// ─────────────────────────────────────────────────────────────
-// Create & list mine (specific before :id routes)
-// ─────────────────────────────────────────────────────────────
+// ── Create & list mine ───────────────────────────────────────
+router.post('/', protect, validate(createShipmentBody), createShipment);
+router.get('/mine', protect, validate(listShipmentsQuery), getMyShipments);
 
-router.post(
-  '/',
-  protect,
-  validate(createShipmentBody),
-  createShipment
-);
+// ── Reprice ─────────────────────────────────────────────────
+router.get('/:id/reprice/preview', protect, requireAgentOrAdmin, previewRepriceShipment);
+router.patch('/:id/reprice', protect, requireAgentOrAdmin, validate(adminRepriceSchema), repriceShipment);
 
-router.get(
-  '/mine',
-  protect,
-  validate(listShipmentsQuery),
-  getMyShipments
-);
+// ── Status, assign, location, cancel ────────────────────────
+router.patch('/:id/status', protect, requireAgentOrAdmin, validate(updateStatusBody), updateShipmentStatus);
+router.patch('/:id/assign-agent', protect, requireAgentOrAdmin, validate(assignAgentBody), assignAgent);
+router.patch('/:id/location', protect, requireAgentOrAdmin, mapParamIdToShipmentId, validate(pushLocationBody), updateShipmentLocation);
+router.patch('/:id/cancel', protect, validate(cancelShipmentBody), cancelShipment);
 
-// ─────────────────────────────────────────────────────────────
-// Reprice (specific paths before generic :id routes)
-// ─────────────────────────────────────────────────────────────
-
-router.get(
-  '/:id/reprice/preview',
+// ── Files upload (accept PATCH and POST) ─────────────────────
+const filesMiddleware = [
   protect,
   requireAgentOrAdmin,
-  previewRepriceShipment // (optional) add query validator later if needed
-);
+  shipmentFilesFields,  // parses beforePhoto/afterPhoto/receipt
+  uploadShipmentFiles,  // controller reads req.files
+];
+router.patch('/:id/files', ...filesMiddleware);
+router.post('/:id/files',  ...filesMiddleware);
 
-router.patch(
-  '/:id/reprice',
-  protect,
-  requireAgentOrAdmin,
-  validate(adminRepriceSchema),
-  repriceShipment
-);
-
-// ─────────────────────────────────────────────────────────────
-// Status, assign, location, cancel
-// ─────────────────────────────────────────────────────────────
-
-router.patch(
-  '/:id/status',
-  protect,
-  requireAgentOrAdmin,
-  validate(updateStatusBody),
-  updateShipmentStatus
-);
-
-router.patch(
-  '/:id/assign-agent',
-  protect,
-  requireAgentOrAdmin,
-  validate(assignAgentBody),
-  assignAgent
-);
-
-router.patch(
-  '/:id/location',
-  protect,
-  requireAgentOrAdmin,
-  mapParamIdToShipmentId,
-  validate(pushLocationBody),
-  updateShipmentLocation
-);
-
-router.patch(
-  '/:id/cancel',
-  protect,
-  validate(cancelShipmentBody), // controller enforces owner/admin
-  cancelShipment
-);
-
-// Files (multer/validation handled in controller)
-router.post(
-  '/:id/files',
-  protect,
-  uploadShipmentFiles
-);
-
-// ─────────────────────────────────────────────────────────────
-// Get by id (keep last so it doesn't shadow above routes)
-// ─────────────────────────────────────────────────────────────
-
-router.get(
-  '/:id',
-  protect,
-  getShipmentByIdForUser
-);
+// ── Get by id (last) ────────────────────────────────────────
+router.get('/:id', protect, getShipmentByIdForUser);
 
 export default router;

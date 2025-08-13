@@ -4,7 +4,7 @@ import { protect, isAdmin } from '../middleware/authMiddleware.js';
 
 // --- keep your existing admin controllers for users/agents/dashboard ---
 import {
-  assignAgentToShipment,   // if you still use this standalone endpoint
+  assignAgentToShipment,
   getAllShipments,
   getShipmentById,
   getDashboardStats,
@@ -29,25 +29,24 @@ import {
 import {
   createPricing,
   listPricing,
-  getPricing as getPricingById,   // alias exported by controller
+  getPricing as getPricingById,
   updatePricing,
   deletePricing,
   getActivePricing,
   setActivePricing,
-  adminQuotePreview,              // GET /api/admin/pricing/quote
+  adminQuotePreview,
 } from '../controllers/pricingController.js';
 
 // --- NEW: shipment repricing (preview/apply) ---
 import {
-  previewReprice,
-  repriceShipment,
+  previewRepriceShipment as previewReprice,
+  repriceShipment as reprice,
 } from '../controllers/shipments/reprice.js';
 
 const router = express.Router();
 
 /**
  * Pricing (Admin)
- * Replaces legacy createOrUpdatePricing/getPricingByRoute etc.
  */
 router.post('/pricing', protect, isAdmin, createPricing);
 router.get('/pricing', protect, isAdmin, listPricing);
@@ -57,7 +56,7 @@ router.patch('/pricing/:id', protect, isAdmin, updatePricing);
 router.patch('/pricing/:id/activate', protect, isAdmin, setActivePricing);
 router.delete('/pricing/:id', protect, isAdmin, deletePricing);
 
-// Admin quote preview (uses active pricing unless you pass pricingVersion in body)
+// Admin quote preview
 router.get('/pricing/quote', protect, isAdmin, adminQuotePreview);
 
 /**
@@ -66,12 +65,12 @@ router.get('/pricing/quote', protect, isAdmin, adminQuotePreview);
 router.get('/shipments', protect, isAdmin, getAllShipments);
 router.get('/shipments/:id', protect, isAdmin, getShipmentById);
 
-// Optional: if you still want a separate admin assign-agent endpoint
+// Optional: separate admin assign-agent endpoint
 router.put('/assign-agent', protect, isAdmin, assignAgentToShipment);
 
 // Repricing: preview + apply
 router.get('/shipments/:id/reprice/preview', protect, isAdmin, previewReprice);
-router.patch('/shipments/:id/reprice', protect, isAdmin, repriceShipment);
+router.patch('/shipments/:id/reprice', protect, isAdmin, reprice); // ← use the imported alias
 
 /**
  * Users (Admin)

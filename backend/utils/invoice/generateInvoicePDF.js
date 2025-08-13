@@ -1,4 +1,3 @@
-// backend/utils/invoice/generateInvoicePDF.js
 import PDFDocument from 'pdfkit';
 import fs from 'fs';
 import path from 'path';
@@ -16,8 +15,8 @@ const {
   INVOICE_LAYOUT = 'a4', // 'a4' | 'thermal'
 
   // A4 header icon (logo & QR) – same size
-  A4_HEADER_ICON_PT = '140',   // change here to tune
-  A4_LOGO_MAX_W = '320',       // kept for fallback text sizing
+  A4_HEADER_ICON_PT = '140',
+  A4_LOGO_MAX_W = '320',
   A4_LOGO_MAX_H = '100',
 
   // Thermal sizing
@@ -55,7 +54,71 @@ function logoAbs() {
 function sum(arr) { return arr.reduce((a, b) => a + (Number(b) || 0), 0); }
 function round2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
 
+/**
+ * IMPORTANT PATCH:
+ * Prefer enriched fields first (subtotal, taxAmount, otherChargesAmount, total),
+ * then fall back to your shipment’s native fields (actualCharges, tax, otherCharges, grandTotal).
+ * This fixes “empty prices” when the generator didn’t understand your data shape.
+ */
 function computeMoney(shipment) {
+  const hasEnriched =
+    shipment &&
+    (
+      shipment.subtotal != null ||
+      shipment.actualCharges != null ||
+      shipment.taxAmount != null ||
+      shipment.tax != null ||
+      shipment.otherChargesAmount != null ||
+      shipment.otherCharges != null ||
+      shipment.total != null ||
+      shipment.grandTotal != null
+    );
+
+  if (hasEnriched) {
+    const subtotal = round2(Number(shipment.subtotal ?? shipment.actualCharges ?? 0));
+    const other = round2(Number(shipment.otherChargesAmount ?? shipment.otherCharges ?? 0));
+    const taxAmount = round2(Number(shipment.taxAmount ?? shipment.tax ?? 0));
+
+    // discount optional
+    let discountLabel = 'Discount';
+    let discountAmount = 0;
+    if (shipment.discount != null) {
+      if (typeof shipment.discount === 'object') {
+        discountLabel = shipment.discount.label || discountLabel;
+        discountAmount = Number(shipment.discount.amount || 0);
+      } else {
+        discountAmount = Number(shipment.discount || 0);
+      }
+      discountAmount = Math.max(0, round2(discountAmount));
+    }
+
+    const explicitTotal = shipment.total ?? shipment.grandTotal;
+    const grandTotal = round2(
+      Number(explicitTotal != null ? explicitTotal : (subtotal + other + taxAmount - discountAmount))
+    );
+
+    const taxes = taxAmount ? [{ label: 'Tax', amount: taxAmount }] : [];
+
+    return {
+      currency: shipment.currency || AFG_CURRENCY,
+      lineItems: [],           // not using itemized pricing here
+      priced: false,           // table not shown; totals section will show
+      baseBreakdown: {         // set zeros so we DON'T duplicate charges
+        baseCharge: 0,
+        serviceCharge: 0,
+        fuelSurcharge: 0,
+        otherFees: 0,
+      },
+      itemsSubtotal: 0,
+      subtotal,
+      taxes,
+      discount: { label: discountLabel, amount: discountAmount },
+      grandTotal,
+      codAmount: Number(shipment.codAmount || 0),
+    };
+  }
+
+  // Legacy path — supports itemized + bespoke base charges
   const items = Array.isArray(shipment.items) ? shipment.items : [];
   const priced = items.some(it => it && (it.unitPrice != null || it.price != null));
   const lineItems = [];
@@ -170,13 +233,13 @@ async function renderA4(doc, shipment, trackUrl, opts = {}) {
   // Pre-generate QR for header
   const qrBuf = await makeQR(trackUrl);
 
-  // Header with blue background, same-size logo & QR, title in header
+  // Header
   const ICON = Math.max(80, parseInt(A4_HEADER_ICON_PT, 10) || 140);
-  const barH = ICON + 44; // little vertical breathing room
+  const barH = ICON + 44;
 
   doc.save().rect(0, 0, doc.page.width, barH).fillColor(BRAND_COLOR).fill();
 
-  // Logo (left)
+  // Logo
   const lp = logoAbs();
   const logoX = doc.page.margins.left;
   const logoY = (barH - ICON) / 2;
@@ -188,14 +251,14 @@ async function renderA4(doc, shipment, trackUrl, opts = {}) {
     doc.fontSize(18).text(COMPANY_NAME, logoX, logoY + ICON / 2 - 12, { width: ICON });
   }
 
-  // QR (right) – same size as logo
+  // QR
   if (qrBuf) {
     const qrX = doc.page.width - doc.page.margins.right - ICON;
     const qrY = (barH - ICON) / 2;
     try { doc.image(qrBuf, qrX, qrY, { width: ICON, height: ICON }); } catch {}
   }
 
-  // Title centered in the blue header
+  // Title
   doc.fontSize(28).fillColor('#fff')
     .text('INVOICE', doc.page.margins.left, barH - 38, {
       width: doc.page.width - doc.page.margins.left - doc.page.margins.right,
@@ -203,17 +266,17 @@ async function renderA4(doc, shipment, trackUrl, opts = {}) {
     });
   doc.restore();
 
-  // Company info under header
+  // Company info
   doc.y = barH + 10;
   doc.fontSize(9).fillColor('#6b7280').text(COMPANY_NAME);
   doc.text(COMPANY_CITY);
   doc.text(`${COMPANY_EMAIL}   ${COMPANY_PHONE}`);
   doc.fillColor('#000').moveDown(0.6);
 
-  // Invoice Details (no QR inside the card anymore)
   const pageW = doc.page.width - doc.page.margins.left - doc.page.margins.right;
   const xLeft = doc.page.margins.left;
 
+  // Invoice details
   const detailsBottom = cardAt(
     doc,
     { x: xLeft, y: doc.y, w: pageW, title: 'Invoice Details', pad: 12 },
@@ -228,18 +291,18 @@ async function renderA4(doc, shipment, trackUrl, opts = {}) {
 
   doc.y = detailsBottom + 8;
 
-  // From / To cards at the exact same top Y
+  // From / To with robust fallbacks
   const colW = Math.floor(pageW / 2) - 10;
-  const rowY = doc.y; // lock row top
+  const rowY = doc.y;
 
   const leftBottom = cardAt(
     doc,
     { x: xLeft, y: rowY, w: colW, title: 'From (Sender)', pad: 12 },
     ({ x, y, w: wIn, kv }) => {
       let yy = y;
-      const from = shipment.from || {};
+      const from = shipment.from || shipment.pickupAddress || shipment.pickup || {};
       yy = kv(x, yy, 'Name', safe(from.name || shipment.sender?.fullName), { w: wIn });
-      yy = kv(x, yy, 'Address', [safe(from.address), safe(from.city), safe(from.province)].filter(Boolean).join(', '), { w: wIn });
+      yy = kv(x, yy, 'Address', [safe(from.line1 || from.address), safe(from.city), safe(from.province)].filter(Boolean).join(', '), { w: wIn });
       yy = kv(x, yy, 'Email', safe(shipment.sender?.email || from.email), { w: wIn });
       yy = kv(x, yy, 'Phone', safe(from.phone), { w: wIn });
       return yy;
@@ -251,9 +314,9 @@ async function renderA4(doc, shipment, trackUrl, opts = {}) {
     { x: xLeft + colW + 20, y: rowY, w: colW, title: 'To (Receiver)', pad: 12 },
     ({ x, y, w: wIn, kv }) => {
       let yy = y;
-      const to = shipment.to || {};
+      const to = shipment.to || shipment.deliveryAddress || shipment.delivery || {};
       yy = kv(x, yy, 'Name', safe(to.name), { w: wIn });
-      yy = kv(x, yy, 'Address', [safe(to.address), safe(to.city), safe(to.province)].filter(Boolean).join(', '), { w: wIn });
+      yy = kv(x, yy, 'Address', [safe(to.line1 || to.address), safe(to.city), safe(to.province)].filter(Boolean).join(', '), { w: wIn });
       yy = kv(x, yy, 'Email', safe(to.email), { w: wIn });
       yy = kv(x, yy, 'Phone', safe(to.phone), { w: wIn });
       return yy;
@@ -262,11 +325,10 @@ async function renderA4(doc, shipment, trackUrl, opts = {}) {
 
   doc.y = Math.max(leftBottom, rightBottom) + 8;
 
-  // Shipment details (two columns)
+  // Shipment details
   const dims = shipment.dimensionsCm || {};
   const dimStr = [dims.length, dims.width, dims.height].every(n => Number(n) > 0)
     ? `${dims.length} × ${dims.width} × ${dims.height} cm` : '—';
-  const declared = shipment.declaredValue != null ? shipment.declaredValue : '—';
   const pieces = shipment.pieces != null ? shipment.pieces : '—';
   const service = (shipment.serviceType || 'EXPRESS').toString();
 
@@ -277,19 +339,19 @@ async function renderA4(doc, shipment, trackUrl, opts = {}) {
       const mid = Math.floor(innerW / 2) - 12;
       let y1 = y, y2 = y;
 
-      y1 = kv(x, y1, 'Weight', `${shipment.weightKg ?? '—'} kg`, { w: mid });
+      y1 = kv(x, y1, 'Weight', `${shipment.chargeableWeightKg ?? shipment.weightKg ?? '—'} kg`, { w: mid });
       y1 = kv(x, y1, 'Dimensions', dimStr, { w: mid });
       y1 = kv(x, y1, 'Pieces', pieces?.toString(), { w: mid });
 
       y2 = kv(x + mid + 24, y2, 'Service', service, { w: innerW - mid - 24 });
-      y2 = kv(x + mid + 24, y2, 'Declared Value', declared?.toString(), { w: innerW - mid - 24 });
+      y2 = kv(x + mid + 24, y2, 'Declared Value', (shipment.declaredValue ?? '—').toString(), { w: innerW - mid - 24 });
       if (shipment.notes) y2 = kv(x + mid + 24, y2, 'Notes', shipment.notes, { w: innerW - mid - 24 });
 
       return Math.max(y1, y2);
     }
   ) + 8;
 
-  // Items & charges
+  // Charges (and items, if any)
   const money = computeMoney(shipment);
 
   if (money.priced && money.lineItems.length) {
@@ -323,7 +385,6 @@ async function renderA4(doc, shipment, trackUrl, opts = {}) {
     doc.fillColor('#000').moveDown(0.5);
   }
 
-  // Charges
   {
     const x0 = xLeft, w = pageW;
     doc.save().roundedRect(x0, doc.y, w, 26, 8).fillColor(BRAND_COLOR).fill();
@@ -338,6 +399,7 @@ async function renderA4(doc, shipment, trackUrl, opts = {}) {
     };
 
     const bb = money.baseBreakdown;
+    // Only show the granular base breakdown if non-zero (avoids duplication with Subtotal)
     if (bb.baseCharge || bb.serviceCharge || bb.fuelSurcharge || bb.otherFees) {
       r('Base Charge', bb.baseCharge);
       r('Service Charge', bb.serviceCharge);
@@ -350,8 +412,10 @@ async function renderA4(doc, shipment, trackUrl, opts = {}) {
 
     if (money.priced && money.itemsSubtotal) r('Items Subtotal', money.itemsSubtotal);
     r('Subtotal', money.subtotal, true);
+
     money.taxes.forEach(t => r(t.label, t.amount));
     if (money.discount.amount > 0) r(money.discount.label, -Math.abs(money.discount.amount));
+
     const yDiv2 = doc.y + 4;
     doc.moveTo(x0, yDiv2).lineTo(x0 + w, yDiv2).lineWidth(0.6).strokeColor('#e5e7eb').stroke();
     doc.moveDown(0.3);
@@ -360,41 +424,39 @@ async function renderA4(doc, shipment, trackUrl, opts = {}) {
   }
 
   // Signatures
-  {
-    const col = Math.floor(pageW / 3) - 10;
-    const blocks = [
-      { title: 'Sender', name: safe(shipment.from?.name || shipment.sender?.fullName || 'Sender') },
-      { title: 'Receiver', name: safe(shipment.to?.name || 'Receiver') },
-      {
-        title: 'Agent',
-        name: safe(opts.agentName || shipment.agent?.fullName || 'Agent'),
-        extra: `Agent ID: ${opts.agentId || shipment.agentId || shipment.agent?.employeeId || shipment.agent?.code || shipment.agent?.idCard || '—'}`
-      },
-    ];
-    const y = doc.y + 6, x0 = xLeft;
-    blocks.forEach((b, i) => {
-      const bx = x0 + i * (col + 15);
-      const by = y;
-      doc.roundedRect(bx, by, col, 96, 8).lineWidth(0.7).strokeColor('#e5e7eb').stroke();
-      doc.fontSize(10).fillColor('#6b7280').text(b.title, bx + 10, by + 8);
-      doc.fontSize(10).fillColor('#111827').text(b.name, bx + 10, by + 24, { width: col - 20 });
-      const sigY = by + 58;
-      doc.moveTo(bx + 10, sigY).lineTo(bx + col - 10, sigY).lineWidth(0.7).strokeColor('#9ca3af').stroke();
-      doc.fontSize(9).fillColor('#6b7280').text('Signature', bx + 10, sigY + 4);
-      const dateY = sigY + 18;
-      doc.moveTo(bx + 10, dateY).lineTo(bx + col - 10, dateY).lineWidth(0.7).strokeColor('#e5e7eb').stroke();
-      doc.fontSize(9).fillColor('#6b7280').text('Date', bx + 10, dateY + 4);
-      if (b.extra) doc.fontSize(9).fillColor('#6b7280').text(b.extra, bx + 10, by + 42, { width: col - 20 });
-    });
-    doc.y = y + 110;
-  }
+  const col = Math.floor(pageW / 3) - 10;
+  const blocks = [
+    { title: 'Sender', name: safe((shipment.from || shipment.pickupAddress || {}).name || shipment.sender?.fullName || 'Sender') },
+    { title: 'Receiver', name: safe((shipment.to || shipment.deliveryAddress || {}).name || 'Receiver') },
+    {
+      title: 'Agent',
+      name: safe(opts.agentName || shipment.agent?.fullName || 'Agent'),
+      extra: `Agent ID: ${opts.agentId || shipment.agentId || shipment.agent?.employeeId || shipment.agent?.code || shipment.agent?.idCard || '—'}`
+    },
+  ];
+  const y = doc.y + 6, x0 = xLeft;
+  blocks.forEach((b, i) => {
+    const bx = x0 + i * (col + 15);
+    const by = y;
+    doc.roundedRect(bx, by, col, 96, 8).lineWidth(0.7).strokeColor('#e5e7eb').stroke();
+    doc.fontSize(10).fillColor('#6b7280').text(b.title, bx + 10, by + 8);
+    doc.fontSize(10).fillColor('#111827').text(b.name, bx + 10, by + 24, { width: col - 20 });
+    const sigY = by + 58;
+    doc.moveTo(bx + 10, sigY).lineTo(bx + col - 10, sigY).lineWidth(0.7).strokeColor('#9ca3af').stroke();
+    doc.fontSize(9).fillColor('#6b7280').text('Signature', bx + 10, sigY + 4);
+    const dateY = sigY + 18;
+    doc.moveTo(bx + 10, dateY).lineTo(bx + col - 10, dateY).lineWidth(0.7).strokeColor('#e5e7eb').stroke();
+    doc.fontSize(9).fillColor('#6b7280').text('Date', bx + 10, dateY + 4);
+    if (b.extra) doc.fontSize(9).fillColor('#6b7280').text(b.extra, bx + 10, by + 42, { width: col - 20 });
+  });
+  doc.y = y + 110;
 
   doc.fontSize(9).fillColor('#9ca3af')
     .text(`© ${new Date().getFullYear()} ${COMPANY_NAME} — ${COMPANY_EMAIL} — ${COMPANY_PHONE}`, { align: 'center' })
     .fillColor('#000');
 }
 
-/* ---------------- Thermal layout (unchanged & stable) ---------------- */
+/* ---------------- Thermal layout ---------------- */
 function hrThermal(doc, gap = 4) {
   const x0 = doc.page.margins.left;
   const w = doc.page.width - doc.page.margins.left - doc.page.margins.right;
@@ -475,34 +537,34 @@ async function renderThermal(doc, shipment, trackUrl, opts = {}) {
 
   hrThermal(doc, 6);
 
-  const from = shipment.from || {}, to = shipment.to || {};
+  const fromSrc = shipment.from || shipment.pickupAddress || shipment.pickup || {};
+  const toSrc = shipment.to || shipment.deliveryAddress || shipment.delivery || {};
   doc.fontSize(12).text('From (Sender)'); doc.moveDown(0.2);
-  kvThermal(doc, 'Name:', safe(from.name || shipment.sender?.fullName), LABEL_W, GAP_W);
-  kvThermal(doc, 'Address:', [safe(from.address), safe(from.city), safe(from.province)].filter(Boolean).join(', '), LABEL_W, GAP_W);
-  kvThermal(doc, 'Email:', safe(shipment.sender?.email || from.email), LABEL_W, GAP_W);
-  kvThermal(doc, 'Phone:', safe(from.phone), LABEL_W, GAP_W);
+  kvThermal(doc, 'Name:', safe(fromSrc.name || shipment.sender?.fullName), LABEL_W, GAP_W);
+  kvThermal(doc, 'Address:', [safe(fromSrc.line1 || fromSrc.address), safe(fromSrc.city), safe(fromSrc.province)].filter(Boolean).join(', '), LABEL_W, GAP_W);
+  kvThermal(doc, 'Email:', safe(shipment.sender?.email || fromSrc.email), LABEL_W, GAP_W);
+  kvThermal(doc, 'Phone:', safe(fromSrc.phone), LABEL_W, GAP_W);
 
   doc.moveDown(0.3);
   doc.fontSize(12).text('To (Receiver)'); doc.moveDown(0.2);
-  kvThermal(doc, 'Name:', safe(to.name), LABEL_W, GAP_W);
-  kvThermal(doc, 'Address:', [safe(to.address), safe(to.city), safe(to.province)].filter(Boolean).join(', '), LABEL_W, GAP_W);
-  kvThermal(doc, 'Email:', safe(to.email), LABEL_W, GAP_W);
-  kvThermal(doc, 'Phone:', safe(to.phone), LABEL_W, GAP_W);
+  kvThermal(doc, 'Name:', safe(toSrc.name), LABEL_W, GAP_W);
+  kvThermal(doc, 'Address:', [safe(toSrc.line1 || toSrc.address), safe(toSrc.city), safe(toSrc.province)].filter(Boolean).join(', '), LABEL_W, GAP_W);
+  kvThermal(doc, 'Email:', safe(toSrc.email), LABEL_W, GAP_W);
+  kvThermal(doc, 'Phone:', safe(toSrc.phone), LABEL_W, GAP_W);
 
   hrThermal(doc, 6);
 
   const dims = shipment.dimensionsCm || {};
   const dimStr = [dims.length, dims.width, dims.height].every(n => Number(n) > 0)
     ? `${dims.length} × ${dims.width} × ${dims.height} cm` : '—';
-  const declared = shipment.declaredValue != null ? shipment.declaredValue : '—';
   const pieces = shipment.pieces != null ? shipment.pieces : '—';
   const service = (shipment.serviceType || 'EXPRESS').toString();
   doc.fontSize(12).text('Shipment Details'); doc.moveDown(0.2);
-  kvThermal(doc, 'Weight:', `${shipment.weightKg ?? '—'} kg`, LABEL_W, GAP_W);
+  kvThermal(doc, 'Weight:', `${shipment.chargeableWeightKg ?? shipment.weightKg ?? '—'} kg`, LABEL_W, GAP_W);
   kvThermal(doc, 'Dimensions:', dimStr, LABEL_W, GAP_W);
   kvThermal(doc, 'Pieces:', pieces?.toString(), LABEL_W, GAP_W);
   kvThermal(doc, 'Service:', service, LABEL_W, GAP_W);
-  kvThermal(doc, 'Declared Value:', declared?.toString(), LABEL_W, GAP_W);
+  kvThermal(doc, 'Declared Value:', (shipment.declaredValue ?? '—').toString(), LABEL_W, GAP_W);
   if (shipment.notes) kvThermal(doc, 'Notes:', shipment.notes, LABEL_W, GAP_W);
 
   hrThermal(doc, 6);
@@ -520,6 +582,7 @@ async function renderThermal(doc, shipment, trackUrl, opts = {}) {
 
   const bb = money.baseBreakdown;
   doc.fontSize(12).text('Charges'); doc.moveDown(0.2);
+  // Show granular base breakdown only if non-zero (avoid duplication with Subtotal)
   if (bb.baseCharge || bb.serviceCharge || bb.fuelSurcharge || bb.otherFees) {
     kvThermal(doc, 'Base Charge:', fmtMoney(bb.baseCharge, money.currency), LABEL_W, GAP_W, true);
     kvThermal(doc, 'Service Charge:', fmtMoney(bb.serviceCharge, money.currency), LABEL_W, GAP_W, true);
@@ -546,8 +609,8 @@ async function renderThermal(doc, shipment, trackUrl, opts = {}) {
     if (extra) { hrThermal(doc, 0); doc.fontSize(9).fillColor('#444').text(extra); doc.moveDown(0.8); }
     doc.fillColor('#000');
   };
-  const senderName = safe(shipment.from?.name || shipment.sender?.fullName || 'Sender');
-  const receiverName = safe(shipment.to?.name || 'Receiver');
+  const senderName = safe((fromSrc.name || shipment.sender?.fullName || 'Sender'));
+  const receiverName = safe((toSrc.name || 'Receiver'));
   const agentName = safe(opts.agentName || shipment.agent?.fullName || 'Agent');
   const agentId = opts.agentId || shipment.agentId || shipment.agent?.employeeId || shipment.agent?.code || shipment.agent?.idCard || '—';
   box('Sender', senderName);
@@ -612,3 +675,6 @@ export async function generateInvoicePDF(shipment, options = {}) {
   doc.end();
   return options.stream ? null : pdfPromise;
 }
+
+// default export for resilience with your import logic
+export default generateInvoicePDF;

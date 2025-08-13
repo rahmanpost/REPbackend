@@ -6,9 +6,9 @@
   "scripts": {
     "start": "node backend/server.js",
     "dev": "env-cmd -f ./backend/.env nodemon backend/server.js",
-    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --detectOpenHandles --forceExit"
-    ,"reprice": "node backend/scripts/bulkReprice.js",
-     "reprice:apply": "node backend/scripts/bulkReprice.js --apply"
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --detectOpenHandles --forceExit",
+    "reprice": "node backend/scripts/bulkReprice.js",
+    "reprice:apply": "node backend/scripts/bulkReprice.js --apply"
   },
   "keywords": [],
   "author": "",
@@ -27,6 +27,7 @@
     "express-rate-limit": "^8.0.1",
     "fs": "^0.0.1-security",
     "geolib": "^3.3.4",
+    "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.17.0",
     "morgan": "^1.10.1",
@@ -37,6 +38,7 @@
     "pdfkit-table": "^0.1.99",
     "qrcode": "^1.5.4",
     "sanitize-html": "^2.17.0",
+    "swagger-ui-express": "^5.0.1",
     "zod": "^4.0.17"
   },
   "devDependencies": {

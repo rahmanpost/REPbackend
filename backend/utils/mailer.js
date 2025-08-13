@@ -14,19 +14,28 @@ const {
   NODE_ENV,
 } = process.env;
 
+// ➜ If using gmail/smtp but creds are missing, fall back to MOCK (no send, writes .eml)
+const CREDS_MISSING =
+  (MAIL_MODE === 'gmail' || MAIL_MODE === 'smtp') && (!EMAIL_USER || !EMAIL_PASS);
+
 let transporter;
 
 /** Create and cache a Nodemailer transporter with multiple modes */
 function getTransporter() {
   if (transporter) return transporter;
 
-  if (MAIL_MODE === 'mock') {
+  // Explicit mock mode OR implicit mock because creds are missing
+  if (MAIL_MODE === 'mock' || CREDS_MISSING) {
     transporter = nodemailer.createTransport({
       streamTransport: true,
       buffer: true,
       newline: 'unix',
     });
-    console.log('[mailer] Using MOCK transport (emails are not sent)');
+    console.warn(
+      CREDS_MISSING
+        ? '[mailer] Missing SMTP creds -> using MOCK transport (emails not sent)'
+        : '[mailer] Using MOCK transport (emails not sent)'
+    );
     return transporter;
   }
 
@@ -44,7 +53,8 @@ function getTransporter() {
       secure: port === 465,
       auth: (EMAIL_USER || EMAIL_PASS) ? { user: EMAIL_USER, pass: EMAIL_PASS } : undefined,
     });
-  } else { // gmail (default)
+  } else {
+    // gmail (default)
     const port = Number(EMAIL_PORT || 465);
     transporter = nodemailer.createTransport({
       host: 'smtp.gmail.com',
@@ -54,6 +64,7 @@ function getTransporter() {
     });
   }
 
+  // Only verify real SMTP transports in non-production
   if (NODE_ENV !== 'production') {
     transporter.verify().then(
       () => console.log('[mailer] SMTP connection verified'),
@@ -162,7 +173,7 @@ export async function sendEmail(opts = {}) {
   });
 
   // If mock mode, save .eml so you can inspect it
-  if (MAIL_MODE === 'mock' && info?.message) {
+  if ((MAIL_MODE === 'mock' || CREDS_MISSING) && info?.message) {
     const out = path.join(process.cwd(), 'backend', 'tmp');
     fs.mkdirSync(out, { recursive: true });
     const p = path.join(out, `mail-${Date.now()}.eml`);

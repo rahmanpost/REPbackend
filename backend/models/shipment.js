@@ -41,7 +41,7 @@ const logSchema = new Schema(
       type: String,
       enum: ['INFO', 'WARN', 'ERROR', 'STATUS', 'LOCATION', 'ASSIGN'],
       default: 'INFO',
-      uppercase: true, // ensure any value saved is uppercased
+      uppercase: true,
       trim: true,
     },
     message: { type: String, trim: true },
@@ -75,6 +75,40 @@ const boxTypeSchema = new Schema(
   { _id: false }
 );
 
+/** New: per-piece items (PARCEL or DOCUMENT) */
+const itemSchema = new Schema(
+  {
+    itemType: { type: String, enum: ['PARCEL', 'DOCUMENT'], required: true },
+    pieces: { type: Number, min: 1, default: 1 },
+    description: { type: String, trim: true, default: '' },
+
+    // For PARCEL items (optional for DOCUMENT)
+    weightKg: { type: Number, min: 0, default: 0 }, // per-piece actual weight
+    lengthCm: { type: Number, min: 0, default: 0 },
+    widthCm: { type: Number, min: 0, default: 0 },
+    heightCm: { type: Number, min: 0, default: 0 },
+    presetBoxSize: { type: Number, enum: [3, 4, 5, 6, 7, 8], default: null },
+
+    declaredValue: { type: Number, min: 0, default: 0 },
+  },
+  { _id: true } // keep _id for addressing item edits later
+);
+
+/** New: payment ledger entries (support partial/mixed) */
+const paymentEntrySchema = new Schema(
+  {
+    amount: { type: Number, min: 0.01, required: true },
+    method: { type: String, enum: ['CASH', 'CARD', 'ONLINE', 'BANK'], required: true },
+    when: { type: Date, default: Date.now },
+    at: { type: String, enum: ['PICKUP', 'DELIVERY', 'OFFICE', 'ONLINE'], default: 'OFFICE' },
+    txnRef: { type: String, trim: true, default: '' },
+    collectedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
+    note: { type: String, trim: true, default: '' },
+    voided: { type: Boolean, default: false },
+  },
+  { _id: true }
+);
+
 const shipmentSchema = new Schema(
   {
     // Actors
@@ -90,7 +124,7 @@ const shipmentSchema = new Schema(
     pickupAddress: { type: addressSchema, required: true },
     deliveryAddress: { type: addressSchema, required: true },
 
-    // Box & dimensions
+    // Box & dimensions (legacy, retained)
     boxType: { type: boxTypeSchema, required: true },
     dimensionsCm: {
       length: { type: Number, min: 1, required: true },
@@ -98,11 +132,14 @@ const shipmentSchema = new Schema(
       height: { type: Number, min: 1, required: true },
     },
 
-    // Weighting
+    // Weighting (legacy, retained)
     weightKg: { type: Number, min: 0, default: 0 }, // physical
     volumetricDivisor: { type: Number, min: 1, default: 5000 }, // cm³/kg
     volumetricWeightKg: { type: Number, min: 0, default: 0 },
     chargeableWeightKg: { type: Number, min: 0, default: 0 },
+
+    // New: items list (PARCEL/DOCUMENT)
+    items: { type: [itemSchema], default: [] },
 
     // Pricing flags + charges (admin-managed)
     pricingVersion: { type: Schema.Types.ObjectId, ref: 'Pricing', default: null },
@@ -159,14 +196,37 @@ const shipmentSchema = new Schema(
       by: { type: Schema.Types.ObjectId, ref: 'User' },
     },
 
-    // Payment meta
+    // Payment meta (legacy fields kept; ledger added)
     payment: {
       mode: { type: String, enum: ['PICKUP', 'DELIVERY'], default: 'DELIVERY' },
-      method: { type: String, enum: ['CASH', 'ONLINE'], default: 'CASH' },
-      status: { type: String, enum: ['UNPAID', 'PAID'], default: 'UNPAID' },
+      method: { type: String, enum: ['CASH', 'ONLINE'], default: 'CASH' }, // preferred/default method
+
+      // Expanded enum for backward-compat + partials
+      status: {
+        type: String,
+        enum: ['UNPAID', 'PARTIALLY_PAID', 'PAID'],
+        default: 'UNPAID',
+      },
+
       collectedAt: { type: Date },
       collectedBy: { type: Schema.Types.ObjectId, ref: 'User' },
       transactionId: { type: String },
+
+      // Authoritative summary
+      summary: {
+        totalDue: { type: Number, default: 0 },
+        totalPaid: { type: Number, default: 0 },
+        balance: { type: Number, default: 0 },
+        // derived mirror of status; left here for quick reads if needed
+        status: {
+          type: String,
+          enum: ['PENDING', 'PARTIALLY_PAID', 'PAID'],
+          default: 'PENDING',
+        },
+      },
+
+      // Ledger: multiple payments, mixed methods/times
+      payments: { type: [paymentEntrySchema], default: [] },
     },
 
     meta: { lastManualEditAt: { type: Date } },
@@ -179,7 +239,7 @@ shipmentSchema.virtual('grandTotal').get(function () {
   return (this.actualCharges || 0) + (this.otherCharges || 0) + (this.tax || 0);
 });
 
-/* -------- Helpers to keep dimensions/weights consistent -------- */
+/* ----------------- Helpers & internal calculators ----------------- */
 function resolveDimensions(doc) {
   const bt = doc.boxType;
   if (!bt) return null;
@@ -194,7 +254,6 @@ function resolveDimensions(doc) {
     if (length && width && height) return { length, width, height };
   }
 
-  // Fallback: keep existing dims if present
   const dims = doc.dimensionsCm;
   if (dims?.length && dims?.width && dims?.height) return dims;
 
@@ -208,7 +267,26 @@ function volumetricFromDimsKg(dims, divisor) {
   return +(volCm3 / divisor).toFixed(4);
 }
 
-/** Auto-calc dims + volumetric + chargeable; flag repricing if weight inputs changed */
+function recomputePaymentSummary(doc) {
+  const payments = Array.isArray(doc.payment?.payments) ? doc.payment.payments : [];
+  const valid = payments.filter((p) => !p.voided && typeof p.amount === 'number' && p.amount > 0);
+  const totalPaid = +valid.reduce((s, p) => s + p.amount, 0).toFixed(2);
+  const totalDue = +((doc.grandTotal || 0)).toFixed(2);
+  const balance = Math.max(totalDue - totalPaid, 0);
+  let status = 'PENDING';
+  if (totalPaid > 0 && balance > 0) status = 'PARTIALLY_PAID';
+  if (totalDue > 0 && balance === 0) status = 'PAID';
+
+  doc.payment.summary.totalDue = totalDue;
+  doc.payment.summary.totalPaid = totalPaid;
+  doc.payment.summary.balance = +balance.toFixed(2);
+  doc.payment.summary.status = status;
+
+  // keep legacy payment.status roughly in sync (UNPAID/PARTIALLY_PAID/PAID)
+  doc.payment.status = status === 'PENDING' ? 'UNPAID' : status;
+}
+
+/* -------- Hooks: auto-calc dims/weights & payment summary -------- */
 shipmentSchema.pre('validate', function (next) {
   try {
     const divisor = this.volumetricDivisor || 5000;
@@ -217,7 +295,7 @@ shipmentSchema.pre('validate', function (next) {
     const dims = resolveDimensions(this);
     if (dims) this.dimensionsCm = dims;
 
-    // Compute volumetric & chargeable
+    // Compute volumetric & chargeable (legacy)
     const volKg = volumetricFromDimsKg(this.dimensionsCm, divisor);
     this.volumetricWeightKg = volKg;
 
@@ -233,6 +311,22 @@ shipmentSchema.pre('validate', function (next) {
     ) {
       this.needsReprice = true;
     }
+
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
+
+shipmentSchema.pre('save', function (next) {
+  try {
+    // Ensure payment objects exist to avoid undefined access
+    if (!this.payment) this.payment = {};
+    if (!this.payment.summary) this.payment.summary = { totalDue: 0, totalPaid: 0, balance: 0, status: 'PENDING' };
+    if (!Array.isArray(this.payment.payments)) this.payment.payments = [];
+
+    // Recompute summary from current grandTotal & ledger
+    recomputePaymentSummary(this);
 
     next();
   } catch (err) {

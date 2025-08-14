@@ -1,6 +1,7 @@
 // backend/models/User.js
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
+import { ROLES, AGENT_TYPES } from './roles.js';
 
 /**
  * Address subdocument (no _id to keep docs compact)
@@ -17,7 +18,7 @@ const addressSchema = new mongoose.Schema(
 );
 
 /**
- * Optional agent profile (only for role === 'agent')
+ * Optional agent profile (extra metadata; role/agentType govern access)
  */
 const agentProfileSchema = new mongoose.Schema(
   {
@@ -29,6 +30,22 @@ const agentProfileSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// Back-compat mapper for legacy lowercase roles
+const normalizeRole = (v) => {
+  if (!v) return v;
+  const up = String(v).toUpperCase();
+  // Map legacy set {admin, agent, customer} -> constants
+  if (up === 'ADMIN') return ROLES.ADMIN;
+  if (up === 'AGENT') return ROLES.AGENT;
+  if (up === 'CUSTOMER') return ROLES.CUSTOMER;
+  if (up === 'SUPER_ADMIN') return ROLES.SUPER_ADMIN;
+  return up; // in case caller already used our constants
+};
+
+// validator to allow null/undefined for agentType, or a valid enum value
+const validateAgentType = (v) =>
+  v == null || Object.values(AGENT_TYPES).includes(v);
+
 const userSchema = new mongoose.Schema(
   {
     fullName: { type: String, required: true, trim: true },
@@ -38,7 +55,6 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
-      // Block empty strings so they don't get indexed as unique
       validate: {
         validator: (v) => typeof v === 'string' && v.trim().length > 0,
         message: 'Phone cannot be empty',
@@ -48,16 +64,29 @@ const userSchema = new mongoose.Schema(
     // Hidden by default; login explicitly selects it
     password: { type: String, required: true, minlength: 6, select: false },
 
+    // UPDATED: role uses shared constants, with normalization
     role: {
       type: String,
-      enum: ['admin', 'agent', 'customer'],
-      default: 'customer',
+      enum: Object.values(ROLES),
+      default: ROLES.CUSTOMER,
       index: true,
+      set: normalizeRole,
+    },
+
+    // NEW: agentType (PICKUP/DELIVERY) only meaningful when role === AGENT
+    agentType: {
+      type: String,
+      default: null,
+      validate: {
+        validator: validateAgentType,
+        message: ({ value }) =>
+          `agentType must be one of: ${Object.values(AGENT_TYPES).join(', ')} (got '${value}')`,
+      },
     },
 
     addresses: { type: [addressSchema], default: [] },
 
-    // Only present for agents
+    // Optional extra metadata for agents
     agentProfile: { type: agentProfileSchema, default: undefined },
 
     // Email verification flow
@@ -85,8 +114,8 @@ const userSchema = new mongoose.Schema(
     toJSON: {
       transform(_doc, ret) {
         delete ret.password;
-        delete ret.passwordReset;     // never expose reset state
-        delete ret.emailVerifyToken;  // never expose verify token
+        delete ret.passwordReset;
+        delete ret.emailVerifyToken;
         delete ret.emailVerifyExpires;
         return ret;
       },

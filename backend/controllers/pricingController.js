@@ -9,14 +9,71 @@ const httpError = (res, code, message) =>
   res.status(code).json({ success: false, message });
 
 const asNum = (v) => (typeof v === 'string' ? Number(v) : v);
+const toNum = (v, d = 0) => {
+  const n = asNum(v);
+  return Number.isFinite(n) ? n : d;
+};
 const isPos = (v) => Number.isFinite(v) && v > 0;
 const isNonNeg = (v) => Number.isFinite(v) && v >= 0;
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+
+const safeString = (v) =>
+  typeof v === 'string'
+    ? v.replace(/[\u0000-\u001F\u007F]/g, '').replace(/\s+/g, ' ').trim()
+    : v;
 
 const presetCodes = Object.keys(BOX_PRESETS).map(Number);
 
-/** Map GET-style inputs to a normalized quote payload */
+/* -------------------------- sanitize complex fields -------------------------- */
+function parseDocumentRates(input) {
+  if (!input || typeof input !== 'object') return undefined;
+  const out = {};
+  if (Array.isArray(input.bands)) {
+    const bands = input.bands
+      .slice(0, 100) // hard cap before further filtering
+      .map((b) => ({
+        maxWeightKg: toNum(b?.maxWeightKg, 0),
+        price: toNum(b?.price, 0),
+      }))
+      .filter((b) => b.maxWeightKg >= 0 && b.price >= 0);
+    // dedupe by maxWeightKg and sort asc
+    const map = new Map();
+    for (const b of bands) if (!map.has(b.maxWeightKg)) map.set(b.maxWeightKg, b);
+    out.bands = Array.from(map.values()).sort((a, b) => a.maxWeightKg - b.maxWeightKg).slice(0, 50);
+  } else {
+    out.bands = [];
+  }
+  if ('overflowPerKg' in input) {
+    out.overflowPerKg = Math.max(0, toNum(input.overflowPerKg, 0));
+  }
+  return out;
+}
+
+function parseOtherCharges(arr) {
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const c of arr.slice(0, 100)) {
+    const label = safeString(c?.label ?? 'Other').slice(0, 60);
+    const amount = toNum(c?.amount, 0);
+    if (amount >= 0) out.push({ label, amount });
+    if (out.length >= 50) break;
+  }
+  return out;
+}
+
+function parseRemoteProvinces(v) {
+  const list = Array.isArray(v)
+    ? v
+    : typeof v === 'string'
+      ? v.split(',') : [];
+  const clean = list.map(safeString).filter(Boolean).map(String);
+  return Array.from(new Set(clean)).slice(0, 100);
+}
+
+/* ----------------------------- quote input helpers ----------------------------- */
 function normalizeQuoteInput(src = {}) {
   const obj = { ...src };
+
   // Support ?boxCode=3
   if (!obj.boxType && obj.boxCode != null && obj.boxCode !== '') {
     obj.boxType = { kind: 'PRESET', code: Number(obj.boxCode) };
@@ -29,9 +86,50 @@ function normalizeQuoteInput(src = {}) {
       height: Number(obj.height),
     };
   }
-  // Coerce weight & divisor
   if (obj.weightKg != null) obj.weightKg = asNum(obj.weightKg);
   if (obj.volumetricDivisor != null) obj.volumetricDivisor = asNum(obj.volumetricDivisor);
+
+  // Optional provinces for remote surcharge logic (free-form, sanitized)
+  if (obj.pickupProvince) obj.pickupProvince = safeString(obj.pickupProvince);
+  if (obj.deliveryProvince) obj.deliveryProvince = safeString(obj.deliveryProvince);
+
+  // Optional items[] (PARCEL/DOCUMENT) for itemized quotes
+  if (Array.isArray(obj.items)) {
+    obj.items = obj.items.slice(0, 200).map((it) => {
+      const itemType = String(it?.itemType || '').toUpperCase();
+      const base = {
+        itemType,
+        pieces: clamp(Math.trunc(toNum(it?.pieces, 1)), 1, 1000),
+        description: safeString(it?.description || '').slice(0, 200),
+        declaredValue: Math.max(0, toNum(it?.declaredValue, 0)),
+      };
+      if (itemType === 'DOCUMENT') {
+        return {
+          ...base,
+          weightKg: Math.max(0, toNum(it?.weightKg, 0)),
+        };
+      }
+      // PARCEL
+      const presetBoxSize = Number.isFinite(asNum(it?.presetBoxSize)) ? Number(it.presetBoxSize) : undefined;
+      const dims =
+        (Number.isFinite(asNum(it?.lengthCm)) &&
+          Number.isFinite(asNum(it?.widthCm)) &&
+          Number.isFinite(asNum(it?.heightCm)))
+          ? {
+              lengthCm: Math.max(0, toNum(it.lengthCm, 0)),
+              widthCm: Math.max(0, toNum(it.widthCm, 0)),
+              heightCm: Math.max(0, toNum(it.heightCm, 0)),
+            }
+          : {};
+      return {
+        ...base,
+        weightKg: Math.max(0, toNum(it?.weightKg, 0)),
+        presetBoxSize: presetBoxSize,
+        ...dims,
+      };
+    });
+  }
+
   return obj;
 }
 
@@ -65,6 +163,14 @@ export const createPricing = async (req, res) => {
       active = false,
       notes = '',
       currency = 'AFN',
+
+      // NEW
+      perPieceSurcharge = 0,
+      documentRates,
+      fuelPct = 0,
+      remoteAreaFee = 0,
+      remoteProvinces,
+      otherCharges,
     } = req.body || {};
 
     const m = String(mode).toUpperCase();
@@ -75,7 +181,6 @@ export const createPricing = async (req, res) => {
     if (!isNonNeg(asNum(baseFee)) || !isNonNeg(asNum(minCharge)) || !isNonNeg(asNum(taxPercent))) {
       return httpError(res, 400, 'baseFee, minCharge, taxPercent must be non-negative numbers');
     }
-
     if (!isPos(asNum(volumetricDivisor))) {
       return httpError(res, 400, 'volumetricDivisor must be > 0');
     }
@@ -88,23 +193,40 @@ export const createPricing = async (req, res) => {
       if (!byM3 && !byCm3) return httpError(res, 400, 'Provide pricePerCubicMeter or pricePerCubicCm in VOLUME mode');
     }
 
+    // NEW validations
+    const _fuelPct = clamp(toNum(fuelPct, 0), 0, 100);
+    const _remoteAreaFee = Math.max(0, toNum(remoteAreaFee, 0));
+    const _perPieceSurcharge = Math.max(0, toNum(perPieceSurcharge, 0));
+    const _remoteProvinces = parseRemoteProvinces(remoteProvinces);
+    const _otherCharges = parseOtherCharges(otherCharges);
+    const _documentRates = parseDocumentRates(documentRates);
+
     if (active) {
       await Pricing.updateMany({ active: true }, { $set: { active: false } });
     }
 
     const doc = await Pricing.create({
-      name: String(name).trim(),
+      name: safeString(String(name)).slice(0, 120),
       mode: m,
-      baseFee: asNum(baseFee) ?? 0,
-      minCharge: asNum(minCharge) ?? 0,
-      taxPercent: asNum(taxPercent) ?? 0,
-      perKg: asNum(perKg) ?? 0,
-      pricePerCubicCm: asNum(pricePerCubicCm) ?? 0,
-      pricePerCubicMeter: asNum(pricePerCubicMeter) ?? 0,
-      volumetricDivisor: asNum(volumetricDivisor) ?? 5000,
+      baseFee: toNum(baseFee, 0),
+      minCharge: toNum(minCharge, 0),
+      taxPercent: clamp(toNum(taxPercent, 0), 0, 100),
+      perKg: toNum(perKg, 0),
+      pricePerCubicCm: toNum(pricePerCubicCm, 0),
+      pricePerCubicMeter: toNum(pricePerCubicMeter, 0),
+      volumetricDivisor: toNum(volumetricDivisor, 5000),
       active: !!active,
-      notes,
-      currency: String(currency || 'AFN').toUpperCase(),
+      notes: safeString(notes).slice(0, 2000),
+      currency: String(currency || 'AFN').toUpperCase().slice(0, 6),
+
+      // NEW
+      perPieceSurcharge: _perPieceSurcharge,
+      documentRates: _documentRates,
+      fuelPct: _fuelPct,
+      remoteAreaFee: _remoteAreaFee,
+      remoteProvinces: _remoteProvinces,
+      otherCharges: _otherCharges,
+
       createdBy: req.user?._id,
       updatedBy: req.user?._id,
     });
@@ -124,20 +246,40 @@ export const updatePricing = async (req, res) => {
     if (!doc) return httpError(res, 404, 'Pricing not found');
 
     const body = req.body || {};
-    if (body.mode) {
+
+    if ('mode' in body) {
       const m = String(body.mode).toUpperCase();
       if (!['WEIGHT', 'VOLUME'].includes(m)) return httpError(res, 400, 'mode must be WEIGHT or VOLUME');
       doc.mode = m;
     }
-    for (const k of ['name', 'notes', 'currency']) {
-      if (k in body) doc[k] = k === 'currency' ? String(body[k]).toUpperCase() : String(body[k]).trim();
-    }
-    for (const k of ['baseFee', 'minCharge', 'taxPercent', 'perKg', 'pricePerCubicCm', 'pricePerCubicMeter', 'volumetricDivisor']) {
+
+    if ('name' in body) doc.name = safeString(String(body.name)).slice(0, 120);
+    if ('notes' in body) doc.notes = safeString(String(body.notes)).slice(0, 2000);
+    if ('currency' in body) doc.currency = String(body.currency).toUpperCase().slice(0, 6);
+
+    for (const k of ['baseFee','minCharge','taxPercent','perKg','pricePerCubicCm','pricePerCubicMeter','volumetricDivisor']) {
       if (k in body) {
         const n = asNum(body[k]);
         if (!Number.isFinite(n)) return httpError(res, 400, `${k} must be a number`);
-        doc[k] = n;
+        doc[k] = k === 'taxPercent' ? clamp(n, 0, 100) : n;
       }
+    }
+
+    // NEW fields
+    if ('perPieceSurcharge' in body) doc.perPieceSurcharge = Math.max(0, toNum(body.perPieceSurcharge, doc.perPieceSurcharge || 0));
+    if ('fuelPct' in body) doc.fuelPct = clamp(toNum(body.fuelPct, doc.fuelPct || 0), 0, 100);
+    if ('remoteAreaFee' in body) doc.remoteAreaFee = Math.max(0, toNum(body.remoteAreaFee, doc.remoteAreaFee || 0));
+    if ('remoteProvinces' in body) doc.remoteProvinces = parseRemoteProvinces(body.remoteProvinces);
+    if ('otherCharges' in body) doc.otherCharges = parseOtherCharges(body.otherCharges);
+    if ('documentRates' in body) doc.documentRates = parseDocumentRates(body.documentRates);
+
+    // active toggle (only one active)
+    if ('active' in body) {
+      const makeActive = !!body.active;
+      if (makeActive) {
+        await Pricing.updateMany({ active: true }, { $set: { active: false } });
+      }
+      doc.active = makeActive;
     }
 
     // sanity checks
@@ -234,20 +376,21 @@ export const deletePricing = async (req, res) => {
 /* ----------------------------- Quotes ----------------------------- */
 
 // GET or POST /api/pricing/quote  (public; uses ACTIVE pricing)
+// Now supports optional items[] and optional pickup/delivery provinces
 export const getQuote = async (req, res) => {
   try {
     const src = req.method === 'GET' ? req.query : req.body;
     const body = normalizeQuoteInput(src);
 
-    // Validate input
-    const weightKg = asNum(body.weightKg);
+    // Validate box/dims input like before
+    const weightKg = toNum(body.weightKg, 0);
     if (!isNonNeg(weightKg)) return httpError(res, 400, 'weightKg must be a non-negative number');
 
     let dims = null;
     if (body.boxType?.kind === 'PRESET') {
       const code = Number(body.boxType.code);
       if (!presetCodes.includes(code)) return httpError(res, 400, `boxType.code must be one of: ${presetCodes.join(', ')}`);
-      // computeTotals will derive dims from code
+      // computeTotals will resolve dims
     } else if (body.boxType?.kind === 'CUSTOM') {
       const { length, width, height } = body.boxType;
       if (!isPos(asNum(length)) || !isPos(asNum(width)) || !isPos(asNum(height))) {
@@ -259,16 +402,23 @@ export const getQuote = async (req, res) => {
         return httpError(res, 400, 'dimensionsCm requires positive length/width/height');
       }
       dims = { length: asNum(length), width: asNum(width), height: asNum(height) };
-    } else {
-      return httpError(res, 400, 'Provide boxType (PRESET or CUSTOM) or dimensionsCm');
+    } else if (!Array.isArray(body.items) || body.items.length === 0) {
+      // When using items[], box/dims can be omitted
+      return httpError(res, 400, 'Provide boxType (PRESET or CUSTOM) or dimensionsCm, or items[]');
     }
 
     const pricing = await loadActiveOrVersion(undefined);
+
     const shipmentLike = {
       boxType: body.boxType,
       dimensionsCm: dims,
       weightKg,
-      volumetricDivisor: asNum(body.volumetricDivisor) || pricing.volumetricDivisor || 5000,
+      volumetricDivisor: toNum(body.volumetricDivisor, pricing.volumetricDivisor || 5000),
+      // Optional remote surcharge context (not required)
+      pickupAddress: body.pickupProvince ? { province: body.pickupProvince } : undefined,
+      deliveryAddress: body.deliveryProvince ? { province: body.deliveryProvince } : undefined,
+      // Optional items[]
+      items: Array.isArray(body.items) && body.items.length ? body.items : undefined,
     };
 
     const totals = computeTotals(shipmentLike, pricing.toObject());
@@ -279,15 +429,18 @@ export const getQuote = async (req, res) => {
 };
 
 // POST /api/admin/quote/preview  (admin; allows pricingVersion override)
+// Also supports items[] and optional provinces
 export const adminQuotePreview = async (req, res) => {
   try {
     const src = req.body || {};
     const body = normalizeQuoteInput(src);
 
-    const weightKg = asNum(body.weightKg);
+    const weightKg = toNum(body.weightKg, 0);
     if (!isNonNeg(weightKg)) return httpError(res, 400, 'weightKg must be a non-negative number');
 
-    if (body.boxType?.kind === 'PRESET') {
+    if (Array.isArray(body.items) && body.items.length) {
+      // If items[] given, we allow box/dims to be omitted
+    } else if (body.boxType?.kind === 'PRESET') {
       const code = Number(body.boxType.code);
       if (!presetCodes.includes(code)) return httpError(res, 400, `boxType.code must be one of: ${presetCodes.join(', ')}`);
     } else if (body.boxType?.kind === 'CUSTOM') {
@@ -301,7 +454,7 @@ export const adminQuotePreview = async (req, res) => {
         return httpError(res, 400, 'dimensionsCm requires positive length/width/height');
       }
     } else {
-      return httpError(res, 400, 'Provide boxType (PRESET or CUSTOM) or dimensionsCm');
+      return httpError(res, 400, 'Provide boxType (PRESET or CUSTOM) or dimensionsCm, or items[]');
     }
 
     const pricing = await loadActiveOrVersion(body.pricingVersion);
@@ -309,7 +462,10 @@ export const adminQuotePreview = async (req, res) => {
       boxType: body.boxType,
       dimensionsCm: body.dimensionsCm,
       weightKg,
-      volumetricDivisor: asNum(body.volumetricDivisor) || pricing.volumetricDivisor || 5000,
+      volumetricDivisor: toNum(body.volumetricDivisor, pricing.volumetricDivisor || 5000),
+      pickupAddress: body.pickupProvince ? { province: body.pickupProvince } : undefined,
+      deliveryAddress: body.deliveryProvince ? { province: body.deliveryProvince } : undefined,
+      items: Array.isArray(body.items) && body.items.length ? body.items : undefined,
     };
 
     const totals = computeTotals(shipmentLike, pricing.toObject());

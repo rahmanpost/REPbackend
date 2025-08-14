@@ -86,7 +86,7 @@ export const listShipmentsQuery = z.object({
     .optional(),
   from: z.coerce.date().optional(),
   to: z.coerce.date().optional(),
-  q: z.string().max(120).transform(trim).optional(), // harmless filter if you still pass it
+  q: z.string().max(120).transform(trim).optional(),
 }).optional();
 
 export const cancelShipmentBody = z.object({
@@ -128,6 +128,57 @@ const boxTypeSchema = z.discriminatedUnion('kind', [
   }),
 ]);
 
+/* ----------------------------- Items schema ----------------------------- */
+/** Per-piece shipment item: PARCEL (preset or dims) or DOCUMENT */
+const parcelItem = z.object({
+  itemType: z.literal('PARCEL'),
+  pieces: z.preprocess(asInt, z.number().int().min(1)).default(1),
+  description: z.string().max(200).transform(trim).optional(),
+
+  weightKg: z.preprocess(asNumber, z.number().min(0)).optional(),
+
+  // Either preset OR all three dims
+  presetBoxSize: z.preprocess(asInt, z.number().int().positive().optional()),
+  lengthCm: z.preprocess(asNumber, z.number().positive().optional()),
+  widthCm: z.preprocess(asNumber, z.number().positive().optional()),
+  heightCm: z.preprocess(asNumber, z.number().positive().optional()),
+
+  declaredValue: z.preprocess(asNumber, z.number().min(0)).optional(),
+}).superRefine((o, ctx) => {
+  const hasPreset = typeof o.presetBoxSize === 'number' && PRESET_CODES.includes(o.presetBoxSize);
+  const hasDims = typeof o.lengthCm === 'number' && typeof o.widthCm === 'number' && typeof o.heightCm === 'number';
+
+  if (!hasPreset && !hasDims) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Provide either presetBoxSize (valid preset) or full dimensions (lengthCm,widthCm,heightCm).' });
+  }
+  if (hasPreset && hasDims) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Use either presetBoxSize or dimensions, not both.' });
+  }
+});
+
+const documentItem = z.object({
+  itemType: z.literal('DOCUMENT'),
+  pieces: z.preprocess(asInt, z.number().int().min(1)).default(1),
+  description: z.string().max(200).transform(trim).optional(),
+
+  // Optional actual per-piece weight; 0 allowed (falls to lowest band)
+  weightKg: z.preprocess(asNumber, z.number().min(0)).optional(),
+
+  // For clarity, disallow parcel-only fields on DOCUMENT
+  presetBoxSize: z.any().optional(),
+  lengthCm: z.any().optional(),
+  widthCm: z.any().optional(),
+  heightCm: z.any().optional(),
+
+  declaredValue: z.preprocess(asNumber, z.number().min(0)).optional(),
+}).superRefine((o, ctx) => {
+  if (o.presetBoxSize != null || o.lengthCm != null || o.widthCm != null || o.heightCm != null) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'DOCUMENT items should not include presetBoxSize or dimensions.' });
+  }
+});
+
+export const itemSchema = z.discriminatedUnion('itemType', [parcelItem, documentItem]);
+
 /* --------------------------- Create Shipment --------------------------- */
 export const createShipmentBody = z.object({
   // server can generate if omitted
@@ -141,12 +192,15 @@ export const createShipmentBody = z.object({
   pickupAddress: structuredAddress,
   deliveryAddress: structuredAddress,
 
-  // box (required)
+  // legacy box/dims kept required for now to stay backwards-compatible
   boxType: boxTypeSchema,
 
   // weighting & pricing knobs
   weightKg: z.preprocess(asNumber, z.number().min(0)).optional(),
   volumetricDivisor: z.preprocess(asInt, z.number().int().positive()).optional(),
+
+  // NEW: items[] (PARCEL/DOCUMENT). Optional (coexists with legacy fields).
+  items: z.array(itemSchema).min(1).optional(),
 
   isCOD: z.preprocess(
     (v) => (v === 'true' || v === true ? true : v === 'false' || v === false ? false : undefined),
@@ -154,10 +208,11 @@ export const createShipmentBody = z.object({
   ),
   codAmount: z.preprocess(asNumber, z.number().min(0)).optional(),
 
+  // Keep legacy payment shape for creation; ledger entries are added via /payments
   payment: z.object({
     mode: z.enum(['PICKUP', 'DELIVERY']).optional(),
     method: z.enum(['CASH', 'ONLINE']).optional(),
-    status: z.enum(['UNPAID', 'PAID']).optional(),
+    status: z.enum(['UNPAID', 'PAID', 'PARTIALLY_PAID']).optional(),
     transactionId: z.string().max(120).transform(trim).optional(),
   }).optional(),
 
@@ -194,3 +249,41 @@ export const adminRepriceSchema = z.object({
   pricingVersion: z.string().regex(OBJECT_ID_RE, 'Invalid pricingVersion').optional(),
   otherCharges: z.preprocess(asNumber, z.number().min(0)).optional(),
 });
+
+/* --------------------------- Payment: Ledger APIs --------------------------- */
+// Path params
+export const paymentIdParams = z.object({
+  id: z.string().regex(OBJECT_ID_RE, 'Invalid shipment id'),
+  pid: z.string().regex(OBJECT_ID_RE, 'Invalid payment id'),
+});
+
+// POST /api/shipments/:id/payments
+export const addPaymentBody = z.object({
+  amount: z.preprocess(asNumber, z.number().positive({ message: 'amount must be > 0' })),
+  method: z.enum(['CASH','CARD','ONLINE','BANK']),
+  at: z.enum(['PICKUP','DELIVERY','OFFICE','ONLINE']).default('OFFICE'),
+  when: z.coerce.date().optional(),
+  txnRef: z.string().max(120).transform(trim).optional(),
+  collectedBy: z.string().regex(OBJECT_ID_RE, 'Invalid collectedBy').optional(),
+  note: z.string().max(240).transform(trim).optional(),
+});
+
+// PATCH /api/shipments/:id/payments/:pid/void
+export const voidPaymentBody = z.object({
+  reason: z.string().max(240).transform(trim).optional(),
+});
+
+// PATCH /api/shipments/:id/payment/settle
+export const settlePaymentBody = z.object({
+  method: z.enum(['CASH','CARD','ONLINE','BANK']),
+  at: z.enum(['PICKUP','DELIVERY','OFFICE','ONLINE']).default('OFFICE'),
+  when: z.coerce.date().optional(),
+  txnRef: z.string().max(120).transform(trim).optional(),
+  note: z.string().max(240).transform(trim).optional(),
+});
+
+// PATCH /api/shipments/:id/payment-method  (pre-payment changes)
+export const changePaymentMethodBody = z.object({
+  mode: z.enum(['PICKUP','DELIVERY']).optional(),
+  method: z.enum(['CASH','ONLINE']).optional(),
+}).refine((o)=>Object.keys(o).length>0,{ message: 'Provide at least one of mode or method' });

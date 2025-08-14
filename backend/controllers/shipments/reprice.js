@@ -28,12 +28,26 @@ const genInvoice =
   invoicePDFMod.generateInvoice ||
   null;
 
-/** Convert Pricing doc -> computeTotals pricing input */
+/** Convert Pricing doc -> computeTotals pricing input (supports itemized fields) */
 function mapPricing(prDoc, fallbackVDivisor) {
   if (!prDoc) return null;
+
+  // Pull optional itemized fields safely (ok if undefined)
+  const documentRates = prDoc.documentRates
+    ? {
+        bands: Array.isArray(prDoc.documentRates.bands) ? prDoc.documentRates.bands : [],
+        overflowPerKg:
+          typeof prDoc.documentRates.overflowPerKg === 'number'
+            ? prDoc.documentRates.overflowPerKg
+            : undefined,
+      }
+    : undefined;
+
   return {
-    pricingVersion: prDoc.name,
+    pricingVersion: prDoc.name, // label for response
     volumetricDivisor: prDoc.volumetricDivisor ?? fallbackVDivisor ?? 5000,
+
+    // Legacy/weight-volume knobs
     mode: prDoc.mode || 'WEIGHT',
     perKg: prDoc.perKg,
     baseFee: prDoc.baseFee || 0,
@@ -41,27 +55,39 @@ function mapPricing(prDoc, fallbackVDivisor) {
     pricePerCubicCm: prDoc.pricePerCubicCm || null,
     pricePerCubicMeter: prDoc.pricePerCubicMeter || null,
     taxPercent: prDoc.taxPercent ?? 0,
-    // extras (not used by your model — safe defaults)
-    fuelPct: 0,
-    remoteAreaFee: 0,
-    remoteProvinces: [],
-    otherCharges: [],
+
+    // Surcharges / extras (safe defaults)
+    fuelPct: Number(prDoc.fuelPct) || 0,
+    remoteAreaFee: Number(prDoc.remoteAreaFee) || 0,
+    remoteProvinces: Array.isArray(prDoc.remoteProvinces) ? prDoc.remoteProvinces : [],
+    otherCharges: Array.isArray(prDoc.otherCharges) ? prDoc.otherCharges : [],
+
+    // NEW (itemized)
+    perPieceSurcharge: Number(prDoc.perPieceSurcharge) || 0,
+    documentRates,
   };
 }
 
 /** Build computeTotals() input from a Shipment doc */
 function makeShipmentLike(sh) {
   return {
+    // legacy fields (still supported)
     boxType: sh.boxType,
+    dimensionsCm: sh.dimensionsCm,
     weightKg: Number(sh.weightKg || 0),
     volumetricDivisor: Number(sh.volumetricDivisor || 5000),
     pickupAddress: sh.pickupAddress,
     deliveryAddress: sh.deliveryAddress,
+
+    // carry over any “other charges” list if you’re using it at shipment level
     otherCharges: Array.isArray(sh.otherCharges) ? sh.otherCharges : [],
+
+    // NEW: items[] (DOCUMENT/PARCEL)
+    items: Array.isArray(sh.items) ? sh.items : undefined,
   };
 }
 
-/** Choose pricing by id/name in query/body, else active */
+/** Choose pricing by id/name in query/body, else the latest active */
 async function pickPricing(req) {
   const v =
     req.query?.version ||
@@ -97,6 +123,7 @@ export const previewRepriceShipment = asyncHandler(async (req, res) => {
   const pricing = mapPricing(pricingDoc, shipmentLike.volumetricDivisor);
   const totals = computeTotals(shipmentLike, pricing);
 
+  // Persistable "otherCharges" number = fuel + remote + labeled-others (your legacy storage)
   const proposedOther = r2(
     (totals.surcharges?.fuel || 0) +
     (totals.surcharges?.remote || 0) +
@@ -140,7 +167,7 @@ export const repriceShipment = asyncHandler(async (req, res) => {
   const pricing = mapPricing(pricingDoc, shipmentLike.volumetricDivisor);
   const totals = computeTotals(shipmentLike, pricing);
 
-  // Apply new totals
+  // Apply new totals to the shipment
   sh.actualCharges = totals.actualCharges;
   sh.tax = totals.tax;
   sh.otherCharges = r2(
@@ -154,12 +181,14 @@ export const repriceShipment = asyncHandler(async (req, res) => {
   sh.logs = sh.logs || [];
   sh.logs.push({
     type: 'INFO',
-    message: `Repriced (admin): ${pricingDoc.name || 'pricing'}`,
+    message: `Repriced (admin): ${pricingDoc.name || 'pricing'}${
+      Array.isArray(sh.items) && sh.items.length ? ` with ${sh.items.length} item(s)` : ''
+    }`,
     at: new Date(),
     by: req.user?._id,
   });
 
-  await sh.save();
+  await sh.save(); // pre('save') hook will recompute payment.summary from grandTotal & ledger
 
   // Refresh invoice on disk (best effort; non-fatal)
   try {
@@ -167,7 +196,7 @@ export const repriceShipment = asyncHandler(async (req, res) => {
 
     if (genInvoice) {
       const { plain, meta } = enrichForInvoice(sh);
-      let out = await genInvoice(plain, { asBuffer: true, invoiceData: meta });
+      const out = await genInvoice(plain, { asBuffer: true, invoiceData: meta });
 
       const buf = Buffer.isBuffer(out)
         ? out

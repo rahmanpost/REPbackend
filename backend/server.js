@@ -29,6 +29,9 @@ import publicRoutes from './routes/publicRoutes.js';
 import pricingRoutes from './routes/pricingRoutes.js';
 import uploadRoutes from './routes/uploadRoutes.js';
 import utilRoutes from './routes/utilRoutes.js'; // ← Postman mail test, etc.
+import superAdminRoutes from './routes/superAdminRoutes.js';
+import paymentRoutes from './routes/paymentRoutes.js';
+
 
 // __dirname in ESM (still useful for paths)
 const __filename = fileURLToPath(import.meta.url);
@@ -96,6 +99,8 @@ app.get('/api/health', (_req, res) => {
 app.use('/uploads', express.static(path.join(process.cwd(), 'backend', 'uploads')));
 
 // Routes
+// Mount super admin routes
+app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/admin', adminRoutes);
@@ -106,6 +111,7 @@ app.use('/api/public', publicRoutes);      // /api/public/track/:trackingId + pr
 app.use('/api/pricing', pricingRoutes);    // user/admin pricing
 app.use('/api/upload', uploadRoutes);
 app.use('/api/utils', utilRoutes);         // ← adds /api/utils/test-mail
+app.use('/api', paymentRoutes);
 
 // 404 + error handler
 app.use(notFound);

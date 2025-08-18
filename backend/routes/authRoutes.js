@@ -33,7 +33,9 @@ const normalizeResetBody = (req, _res, next) => {
   next();
 };
 
+
 router.post('/register', validate(registerSchema), register);   // or registerUser alias
+
 router.post('/login', validate(loginSchema), login);            // or loginUser alias
 router.get('/me', protect, getMe);
 router.post('/logout', protect, logout);

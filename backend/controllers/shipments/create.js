@@ -14,6 +14,10 @@ import { emailInvoiceForShipment } from './sendInvoice.js';
 import { isObjectId, httpError } from './_shared.js';
 import { enrichForInvoice } from '../../utils/invoice/enrich.js';
 
+
+// NEW: WhatsApp invoice sender (non-blocking, safe)
+import { sendInvoiceWhatsApp } from '../../utils/whatsapp/sendInvoice.js';
+
 // Local invoice storage helpers
 import {
   saveInvoiceBuffer,
@@ -90,7 +94,6 @@ function sanitizeItems(items) {
 /* -------------------------- pricing mapper (safe) -------------------------- */
 function mapPricingForCompute(prDoc, fallbackVDivisor) {
   if (!prDoc) return null;
-  // Note: we pass fields as computeTotals understands them (including our new ones)
   const obj = prDoc.toObject ? prDoc.toObject() : prDoc;
 
   return {
@@ -167,7 +170,7 @@ async function tryGenerateInvoice(shipment, opts = {}) {
 /**
  * Create shipment:
  * - Auto-price if active Pricing exists (supports items[] and DOCUMENT bands)
- * - Save invoice PDF to disk (when totals exist) and email it (best effort)
+ * - Save invoice PDF to disk (when totals exist), email it (best effort), and WhatsApp it (best effort)
  * - Response includes links to download invoice (dynamic + static)
  */
 export const createShipment = asyncHandler(async (req, res) => {
@@ -192,6 +195,11 @@ export const createShipment = asyncHandler(async (req, res) => {
 
   // Optional labeled other charges (for computeTotals only)
   const otherChargesList = parseOtherCharges(body.otherCharges);
+
+  // NEW (not persisted yet): simple shipment details for messaging
+  const itemsDescription = safeString(body.itemsDescription || '', 800);
+  const piecesTotal = clamp(Math.trunc(asNum(body.piecesTotal, 0)), 0, 100000);
+  const totalDeclaredValue = Math.max(0, asNum(body.totalDeclaredValue, 0));
 
   // Invoice number (unique or generated)
   let finalInvoiceNumber =
@@ -310,9 +318,13 @@ export const createShipment = asyncHandler(async (req, res) => {
 
   const shipment = await Shipment.create(doc);
 
-  // Build stable invoice URL
-  const rawOrigin = process.env.API_ORIGIN || `${req.protocol}://${req.get('host') || ''}`;
-  const base = rawOrigin.split('#')[0].trim().replace(/\/+$/, '');
+  // Build stable origins
+  const rawApiOrigin = process.env.API_ORIGIN || `${req.protocol}://${req.get('host') || ''}`;
+  const base = rawApiOrigin.split('#')[0].trim().replace(/\/+$/, '');
+  const publicBase =
+    (process.env.PUBLIC_APP_ORIGIN || '').trim().replace(/\/+$/, '') || base;
+
+  // Build invoice URL (dynamic endpoint always works)
   const invoiceUrl = `${base}/api/invoice/${shipment._id}/pdf`;
 
   // Safety: ensure needsReprice coherence
@@ -321,7 +333,7 @@ export const createShipment = asyncHandler(async (req, res) => {
     await shipment.save(); // model hook will recompute payment.summary
   }
 
-  /* -------------------------- invoice + email (bg) ------------------------- */
+  /* -------------------------- invoice + email + WhatsApp (bg) ------------------------- */
   (async () => {
     try {
       if (!totals) return; // skip when needsReprice=true
@@ -367,24 +379,46 @@ export const createShipment = asyncHandler(async (req, res) => {
       }
 
       // Email (prefer saved file)
-      const senderUser = await User.findById(senderId).select('email name').lean();
-      const recipientEmail = senderUser?.email;
-      if (!recipientEmail) return;
-
-      if (savedAbs) {
-        await emailInvoiceForShipment({
-          shipment,
-          recipientEmail,
-          pdfPath: savedAbs,
-        });
-      } else {
-        const { buffer: pdfBuffer, path: pdfPath } = await tryGenerateInvoice(shipment);
-        if (pdfBuffer || pdfPath) {
-          await emailInvoiceForShipment({ shipment, recipientEmail, pdfBuffer, pdfPath });
+      try {
+        const senderUser = await User.findById(senderId).select('email name').lean();
+        const recipientEmail = senderUser?.email;
+        if (recipientEmail) {
+          if (savedAbs) {
+            await emailInvoiceForShipment({
+              shipment,
+              recipientEmail,
+              pdfPath: savedAbs,
+            });
+          } else {
+            const { buffer: pdfBuffer, path: pdfPath } = await tryGenerateInvoice(shipment);
+            if (pdfBuffer || pdfPath) {
+              await emailInvoiceForShipment({ shipment, recipientEmail, pdfBuffer, pdfPath });
+            }
+          }
         }
+      } catch (emailErr) {
+        console.error('[email] post-create failed');
       }
+       // WhatsApp (best effort, non-blocking)
+try {
+  // Prefer the static, publicly served uploads URL so WhatsApp can fetch it
+  const relPath = shipment?.attachments?.invoicePdf?.path || null;
+  const staticUrl = relPath ? `${publicBase}${relPath}` : null;
+  // Fallback to dynamic API URL (only works if it’s public)
+  const invoicePublicUrl = staticUrl || `${base}/api/invoice/${shipment._id}/pdf`;
+
+  await sendInvoiceWhatsApp({
+    shipment,                                   // helper reads phone + names from shipment
+    invoiceUrl: invoicePublicUrl,               // document link WhatsApp downloads
+    filename: makeInvoiceFilename(shipment),    // e.g. REP-YYYYMMDD-XXXX.pdf
+  });
+} catch (waErr) {
+  console.error('[whatsapp] invoice send failed', waErr.message || waErr);
+}
+
+
     } catch (err) {
-      console.error('[invoice save/email] post-create failed:', err?.message || err);
+      console.error('[invoice save/email/whatsapp] post-create failed:', err?.message || err);
     }
   })();
 

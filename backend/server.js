@@ -1,7 +1,9 @@
 // Load env FIRST so downstream imports (routes/controllers) see process.env
 import './config/loadEnv.js';
 import healthRoutes from './routes/healthRoutes.js';
-
+import * as auth from './middleware/authMiddleware.js';
+const authenticate =
+  auth.authenticate ?? auth.requireUser ?? auth.protect ?? auth.default;
 
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -32,6 +34,16 @@ import utilRoutes from './routes/utilRoutes.js'; // ← Postman mail test, etc.
 import superAdminRoutes from './routes/superAdminRoutes.js';
 import paymentRoutes from './routes/paymentRoutes.js';
 
+import staffRouter from './routes/admin/staff.js';
+import payrollRouter from './routes/admin/payroll.js';
+import expensesRouter from './routes/admin/expenses.js';
+import metricsRouter from './routes/admin/metrics.js';
+
+import debugWhatsAppRoutes from './routes/debugWhatsAppRoutes.js';
+
+
+
+
 
 // __dirname in ESM (still useful for paths)
 const __filename = fileURLToPath(import.meta.url);
@@ -41,7 +53,6 @@ const __dirname  = path.dirname(__filename);
 connectDB();
 
 const app = express();
-
 // Security & platform
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
@@ -70,6 +81,7 @@ app.use('/api/docs', docsRoutes);
 // Body parsers
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+app.use('/api/debug', debugWhatsAppRoutes);
 
 // Cookies
 app.use(cookieParser());
@@ -112,6 +124,13 @@ app.use('/api/pricing', pricingRoutes);    // user/admin pricing
 app.use('/api/upload', uploadRoutes);
 app.use('/api/utils', utilRoutes);         // ← adds /api/utils/test-mail
 app.use('/api', paymentRoutes);
+
+app.use('/api/admin/staff', authenticate, staffRouter);
+app.use('/api/admin/payroll', authenticate, payrollRouter);
+app.use('/api/admin/expenses', authenticate, expensesRouter);
+app.use('/api/admin/metrics', authenticate, metricsRouter);
+
+
 
 // 404 + error handler
 app.use(notFound);

@@ -75,7 +75,7 @@ const boxTypeSchema = new Schema(
   { _id: false }
 );
 
-/** New: per-piece items (PARCEL or DOCUMENT) */
+/** Per-item details (optional, retained) */
 const itemSchema = new Schema(
   {
     itemType: { type: String, enum: ['PARCEL', 'DOCUMENT'], required: true },
@@ -91,10 +91,10 @@ const itemSchema = new Schema(
 
     declaredValue: { type: Number, min: 0, default: 0 },
   },
-  { _id: true } // keep _id for addressing item edits later
+  { _id: true }
 );
 
-/** New: payment ledger entries (support partial/mixed) */
+/** Payment ledger entries (support partial/mixed) */
 const paymentEntrySchema = new Schema(
   {
     amount: { type: Number, min: 0.01, required: true },
@@ -138,8 +138,13 @@ const shipmentSchema = new Schema(
     volumetricWeightKg: { type: Number, min: 0, default: 0 },
     chargeableWeightKg: { type: Number, min: 0, default: 0 },
 
-    // New: items list (PARCEL/DOCUMENT)
+    // Items list (retained)
     items: { type: [itemSchema], default: [] },
+
+    // SIMPLE PLACEHOLDERS (your request)
+    itemsDescription: { type: String, trim: true, default: '' },
+    piecesTotal: { type: Number, min: 0, default: 0 },
+    totalDeclaredValue: { type: Number, min: 0, default: 0 },
 
     // Pricing flags + charges (admin-managed)
     pricingVersion: { type: Schema.Types.ObjectId, ref: 'Pricing', default: null },
@@ -201,7 +206,6 @@ const shipmentSchema = new Schema(
       mode: { type: String, enum: ['PICKUP', 'DELIVERY'], default: 'DELIVERY' },
       method: { type: String, enum: ['CASH', 'ONLINE'], default: 'CASH' }, // preferred/default method
 
-      // Expanded enum for backward-compat + partials
       status: {
         type: String,
         enum: ['UNPAID', 'PARTIALLY_PAID', 'PAID'],
@@ -212,12 +216,10 @@ const shipmentSchema = new Schema(
       collectedBy: { type: Schema.Types.ObjectId, ref: 'User' },
       transactionId: { type: String },
 
-      // Authoritative summary
       summary: {
         totalDue: { type: Number, default: 0 },
         totalPaid: { type: Number, default: 0 },
         balance: { type: Number, default: 0 },
-        // derived mirror of status; left here for quick reads if needed
         status: {
           type: String,
           enum: ['PENDING', 'PARTIALLY_PAID', 'PAID'],
@@ -225,7 +227,6 @@ const shipmentSchema = new Schema(
         },
       },
 
-      // Ledger: multiple payments, mixed methods/times
       payments: { type: [paymentEntrySchema], default: [] },
     },
 
@@ -301,6 +302,28 @@ shipmentSchema.pre('validate', function (next) {
 
     const physical = this.weightKg || 0;
     this.chargeableWeightKg = +Math.max(physical, volKg).toFixed(4);
+
+    // Simple sanitize/normalize for new placeholders
+    if (typeof this.itemsDescription === 'string') {
+      this.itemsDescription = this.itemsDescription
+        .replace(/[\u0000-\u001F\u007F]/g, '')
+        .trim()
+        .slice(0, 2000);
+    } else if (this.itemsDescription == null) {
+      this.itemsDescription = '';
+    }
+
+    const pTotal = Number(this.piecesTotal);
+    this.piecesTotal = Number.isFinite(pTotal) && pTotal >= 0 ? Math.min(Math.trunc(pTotal), 100000) : 0;
+
+    const tdv = Number(this.totalDeclaredValue);
+    this.totalDeclaredValue = Number.isFinite(tdv) && tdv >= 0 ? +tdv : 0;
+
+    // Helpful fallback: if piecesTotal is zero and items[] exist, sum pieces
+    if ((!this.piecesTotal || this.piecesTotal === 0) && Array.isArray(this.items) && this.items.length) {
+      const sum = this.items.reduce((s, it) => s + (Number(it?.pieces) > 0 ? Number(it.pieces) : 0), 0);
+      if (sum > 0) this.piecesTotal = Math.min(sum, 100000);
+    }
 
     // If inputs that affect price changed, require repricing
     if (

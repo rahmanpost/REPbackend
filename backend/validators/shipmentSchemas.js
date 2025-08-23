@@ -14,6 +14,10 @@ const CANON = Object.fromEntries(PROVINCES.map((p) => [p.toLowerCase(), p]));
 /* ------------------------------ Helpers ------------------------------ */
 export const OBJECT_ID_RE = /^[0-9a-fA-F]{24}$/;
 const trim = (s) => (typeof s === 'string' ? s.trim() : s);
+const sanitizeText = (s, max = 2000) => {
+  if (typeof s !== 'string') return s;
+  return s.replace(/[\u0000-\u001F\u007F]/g, '').trim().slice(0, max);
+};
 const asNumber = (v) => {
   if (v === '' || v === null || typeof v === 'undefined') return undefined;
   if (typeof v === 'number') return v;
@@ -199,8 +203,13 @@ export const createShipmentBody = z.object({
   weightKg: z.preprocess(asNumber, z.number().min(0)).optional(),
   volumetricDivisor: z.preprocess(asInt, z.number().int().positive()).optional(),
 
-  // NEW: items[] (PARCEL/DOCUMENT). Optional (coexists with legacy fields).
-  items: z.array(itemSchema).min(1).optional(),
+  // NEW: simple placeholders
+  itemsDescription: z.string().max(2000).transform((s) => sanitizeText(s, 2000)).optional(),
+  piecesTotal: z.preprocess(asInt, z.number().int().min(0).max(100000)).optional(),
+  totalDeclaredValue: z.preprocess(asNumber, z.number().min(0)).optional(),
+
+  // Optional items[] (cap to prevent huge payloads)
+  items: z.array(itemSchema).min(1).max(200).optional(),
 
   isCOD: z.preprocess(
     (v) => (v === 'true' || v === true ? true : v === 'false' || v === false ? false : undefined),

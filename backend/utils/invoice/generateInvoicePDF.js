@@ -34,7 +34,12 @@ const AFG_CURRENCY = 'AFN';
 /* ---------- helpers ---------- */
 function fmtMoney(v, currency = AFG_CURRENCY) {
   const n = Number(v || 0);
-  return new Intl.NumberFormat('en-AF', { style: 'currency', currency, minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
+  return new Intl.NumberFormat('en-AF', {
+    style: 'currency',
+    currency,
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(n);
 }
 function fmtDateTimeKabul(d = new Date()) {
   const date = new Intl.DateTimeFormat('en-US', { timeZone: TZ, year: 'numeric', month: 'short', day: '2-digit' }).format(d);
@@ -42,6 +47,10 @@ function fmtDateTimeKabul(d = new Date()) {
   return `${date}, ${time} AFT`;
 }
 function safe(v) { return (v ?? '').toString(); }
+function sanitizeText(v, max = 2000) {
+  if (v == null) return '';
+  return String(v).replace(/[\u0000-\u001F\u007F]/g, '').trim().slice(0, max);
+}
 async function makeQR(trackUrl) {
   try {
     const dataUrl = await QRCode.toDataURL(trackUrl, { margin: 0, scale: 6 });
@@ -55,10 +64,8 @@ function sum(arr) { return arr.reduce((a, b) => a + (Number(b) || 0), 0); }
 function round2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
 
 /**
- * IMPORTANT PATCH:
  * Prefer enriched fields first (subtotal, taxAmount, otherChargesAmount, total),
- * then fall back to your shipment’s native fields (actualCharges, tax, otherCharges, grandTotal).
- * This fixes “empty prices” when the generator didn’t understand your data shape.
+ * then fall back to shipment native fields (actualCharges, tax, otherCharges, grandTotal).
  */
 function computeMoney(shipment) {
   const hasEnriched =
@@ -101,14 +108,9 @@ function computeMoney(shipment) {
 
     return {
       currency: shipment.currency || AFG_CURRENCY,
-      lineItems: [],           // not using itemized pricing here
-      priced: false,           // table not shown; totals section will show
-      baseBreakdown: {         // set zeros so we DON'T duplicate charges
-        baseCharge: 0,
-        serviceCharge: 0,
-        fuelSurcharge: 0,
-        otherFees: 0,
-      },
+      lineItems: [],
+      priced: false,
+      baseBreakdown: { baseCharge: 0, serviceCharge: 0, fuelSurcharge: 0, otherFees: 0 },
       itemsSubtotal: 0,
       subtotal,
       taxes,
@@ -325,11 +327,25 @@ async function renderA4(doc, shipment, trackUrl, opts = {}) {
 
   doc.y = Math.max(leftBottom, rightBottom) + 8;
 
-  // Shipment details
+  // Shipment details (+ your new fields)
   const dims = shipment.dimensionsCm || {};
   const dimStr = [dims.length, dims.width, dims.height].every(n => Number(n) > 0)
     ? `${dims.length} × ${dims.width} × ${dims.height} cm` : '—';
-  const pieces = shipment.pieces != null ? shipment.pieces : '—';
+
+  // piecesTotal -> fallback: sum items[].pieces
+  const piecesTotal =
+    Number.isFinite(Number(shipment.piecesTotal)) && Number(shipment.piecesTotal) >= 0
+      ? Number(shipment.piecesTotal)
+      : Array.isArray(shipment.items)
+        ? shipment.items.reduce((s, it) => s + (Number(it?.pieces) > 0 ? Number(it.pieces) : 0), 0)
+        : 0;
+
+  const declaredValue = Number.isFinite(Number(shipment.totalDeclaredValue))
+    ? Number(shipment.totalDeclaredValue)
+    : 0;
+
+  const itemsDesc = sanitizeText(shipment.itemsDescription || '', 1200);
+  const currency = shipment.currency || AFG_CURRENCY;
   const service = (shipment.serviceType || 'EXPRESS').toString();
 
   doc.y = cardAt(
@@ -341,11 +357,12 @@ async function renderA4(doc, shipment, trackUrl, opts = {}) {
 
       y1 = kv(x, y1, 'Weight', `${shipment.chargeableWeightKg ?? shipment.weightKg ?? '—'} kg`, { w: mid });
       y1 = kv(x, y1, 'Dimensions', dimStr, { w: mid });
-      y1 = kv(x, y1, 'Pieces', pieces?.toString(), { w: mid });
+      y1 = kv(x, y1, 'Pieces', piecesTotal ? String(piecesTotal) : '—', { w: mid });
 
       y2 = kv(x + mid + 24, y2, 'Service', service, { w: innerW - mid - 24 });
-      y2 = kv(x + mid + 24, y2, 'Declared Value', (shipment.declaredValue ?? '—').toString(), { w: innerW - mid - 24 });
-      if (shipment.notes) y2 = kv(x + mid + 24, y2, 'Notes', shipment.notes, { w: innerW - mid - 24 });
+      y2 = kv(x + mid + 24, y2, 'Total Declared Value', fmtMoney(declaredValue, currency), { w: innerW - mid - 24 });
+      if (itemsDesc) y2 = kv(x + mid + 24, y2, 'Items Description', itemsDesc, { w: innerW - mid - 24 });
+      if (shipment.notes) y2 = kv(x + mid + 24, y2, 'Notes', sanitizeText(shipment.notes, 2000), { w: innerW - mid - 24 });
 
       return Math.max(y1, y2);
     }
@@ -399,7 +416,6 @@ async function renderA4(doc, shipment, trackUrl, opts = {}) {
     };
 
     const bb = money.baseBreakdown;
-    // Only show the granular base breakdown if non-zero (avoids duplication with Subtotal)
     if (bb.baseCharge || bb.serviceCharge || bb.fuelSurcharge || bb.otherFees) {
       r('Base Charge', bb.baseCharge);
       r('Service Charge', bb.serviceCharge);
@@ -557,15 +573,30 @@ async function renderThermal(doc, shipment, trackUrl, opts = {}) {
   const dims = shipment.dimensionsCm || {};
   const dimStr = [dims.length, dims.width, dims.height].every(n => Number(n) > 0)
     ? `${dims.length} × ${dims.width} × ${dims.height} cm` : '—';
-  const pieces = shipment.pieces != null ? shipment.pieces : '—';
+
+  const piecesTotal =
+    Number.isFinite(Number(shipment.piecesTotal)) && Number(shipment.piecesTotal) >= 0
+      ? Number(shipment.piecesTotal)
+      : Array.isArray(shipment.items)
+        ? shipment.items.reduce((s, it) => s + (Number(it?.pieces) > 0 ? Number(it.pieces) : 0), 0)
+        : 0;
+
+  const declaredValue = Number.isFinite(Number(shipment.totalDeclaredValue))
+    ? Number(shipment.totalDeclaredValue)
+    : 0;
+
+  const itemsDesc = sanitizeText(shipment.itemsDescription || '', 600);
+  const currency = shipment.currency || AFG_CURRENCY;
   const service = (shipment.serviceType || 'EXPRESS').toString();
+
   doc.fontSize(12).text('Shipment Details'); doc.moveDown(0.2);
   kvThermal(doc, 'Weight:', `${shipment.chargeableWeightKg ?? shipment.weightKg ?? '—'} kg`, LABEL_W, GAP_W);
   kvThermal(doc, 'Dimensions:', dimStr, LABEL_W, GAP_W);
-  kvThermal(doc, 'Pieces:', pieces?.toString(), LABEL_W, GAP_W);
+  kvThermal(doc, 'Pieces:', piecesTotal ? String(piecesTotal) : '—', LABEL_W, GAP_W);
   kvThermal(doc, 'Service:', service, LABEL_W, GAP_W);
-  kvThermal(doc, 'Declared Value:', (shipment.declaredValue ?? '—').toString(), LABEL_W, GAP_W);
-  if (shipment.notes) kvThermal(doc, 'Notes:', shipment.notes, LABEL_W, GAP_W);
+  kvThermal(doc, 'Total Declared Value:', fmtMoney(declaredValue, currency), LABEL_W, GAP_W);
+  if (itemsDesc) kvThermal(doc, 'Items:', itemsDesc, LABEL_W, GAP_W);
+  if (shipment.notes) kvThermal(doc, 'Notes:', sanitizeText(shipment.notes, 2000), LABEL_W, GAP_W);
 
   hrThermal(doc, 6);
 
@@ -582,7 +613,6 @@ async function renderThermal(doc, shipment, trackUrl, opts = {}) {
 
   const bb = money.baseBreakdown;
   doc.fontSize(12).text('Charges'); doc.moveDown(0.2);
-  // Show granular base breakdown only if non-zero (avoid duplication with Subtotal)
   if (bb.baseCharge || bb.serviceCharge || bb.fuelSurcharge || bb.otherFees) {
     kvThermal(doc, 'Base Charge:', fmtMoney(bb.baseCharge, money.currency), LABEL_W, GAP_W, true);
     kvThermal(doc, 'Service Charge:', fmtMoney(bb.serviceCharge, money.currency), LABEL_W, GAP_W, true);
